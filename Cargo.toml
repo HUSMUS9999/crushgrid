@@ -1,6 +1,6 @@
 [package]
 name = "squiz-archive"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT"
 description = "Wi-Fi-native distributed HPC compression & archival engine (Rust + C/ASM SIMD, Zstd LDM, LZMA2, BLAKE3 dedup, AES-256-GCM)"

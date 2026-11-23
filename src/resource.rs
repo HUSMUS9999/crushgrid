@@ -1,7 +1,50 @@
 use crate::protocol::WorkerCaps;
 use anyhow::{Context, Result, bail};
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+#[derive(Debug, Default, Clone)]
+pub struct ClusterFileConfig {
+    pub token: Option<String>,
+    pub security: Option<String>,
+    pub wire_codec: Option<String>,
+    pub mem_limit: Option<String>,
+    pub streams: Option<usize>,
+    pub nodes: Vec<String>,
+}
+
+/// Load an N-node cluster config file (`cluster.conf`) supporting arbitrary numbers of LAN/Tailscale/Cloud workers.
+pub fn load_cluster_file(path: &Path) -> Result<ClusterFileConfig> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed reading cluster config {}", path.display()))?;
+    let mut cfg = ClusterFileConfig::default();
+    for (lineno, raw_line) in text.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = line
+            .split_once('=')
+            .with_context(|| format!("invalid syntax in {} line {}: expected key = value", path.display(), lineno + 1))?;
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        match key.as_str() {
+            "token" => cfg.token = Some(val),
+            "security" => cfg.security = Some(val),
+            "wire_codec" | "wire-codec" => cfg.wire_codec = Some(val),
+            "mem_limit" | "mem-limit" => cfg.mem_limit = Some(val),
+            "streams" => {
+                let s: usize = val.parse().with_context(|| format!("invalid streams on line {}", lineno + 1))?;
+                cfg.streams = Some(s.clamp(1, 8));
+            }
+            "node" => cfg.nodes.push(val),
+            other => bail!("unknown key '{}' in {} line {}", other, path.display(), lineno + 1),
+        }
+    }
+    Ok(cfg)
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalSysInfo {

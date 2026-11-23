@@ -21,7 +21,7 @@ use crossbeam_channel::{RecvTimeoutError, bounded, unbounded};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -308,7 +308,13 @@ fn probe_single_node(spec: NodeSpec, token: &str, security: SecurityMode) -> Pro
     }
 
     let res: Result<(WorkerCaps, f64, f64)> = (|| {
-        let mut stream = TcpStream::connect(&spec.target)
+        let addr = spec
+            .target
+            .to_socket_addrs()
+            .with_context(|| format!("resolve {}", spec.target))?
+            .next()
+            .with_context(|| format!("no address for {}", spec.target))?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .with_context(|| format!("connect {}", spec.target))?;
         tune_tcp_stream(&stream)?;
         let (mut cipher, caps) = client_handshake(&mut stream, token, security, 0, 0, 0)?;

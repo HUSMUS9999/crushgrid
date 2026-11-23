@@ -13,7 +13,10 @@ use clap::{Parser, Subcommand};
 use codec::CodecId;
 use container::ContainerFormat;
 use protocol::{DEFAULT_MAX_FRAME_BYTES, SecurityMode, WireCodec};
-use resource::{NodeSpec, interactive_pick, parse_size, probe_local_system};
+use resource::{
+    ClusterFileConfig, NodeSpec, interactive_pick, load_cluster_file, parse_size,
+    probe_local_system,
+};
 use scheduler::{
     CompressParams, DecompressParams, PackParams, ScheduleMode, hash_file_blake3, hex_encode,
     probe_nodes, run_compress, run_decompress, run_inspect, run_net_bench, run_pack, run_unpack,
@@ -26,7 +29,7 @@ use worker::{WorkerConfig, run_worker};
 #[command(
     name = "squiz-archive",
     version,
-    about = "Wi-Fi-native distributed HPC compression & archival engine (Rust + C/ASM SIMD, Zstd LDM, LZMA2, BLAKE3 dedup, AES-256-GCM)"
+    about = "N-node distributed HPC compression & archival engine for LAN, Tailscale, and Cloud/Internet (Rust + C/ASM SIMD, Zstd LDM, LZMA2, BLAKE3 dedup, AES-256-GCM)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,7 +40,7 @@ struct Cli {
 enum Commands {
     /// Run a secure multi-stream compute worker daemon with hard CPU/RAM ceilings
     Worker {
-        /// Listen address (e.g. 0.0.0.0:7878)
+        /// Listen address (e.g. 0.0.0.0:7878 or your Tailscale IP:7878)
         #[arg(long, default_value = "0.0.0.0:7878")]
         bind: SocketAddr,
 
@@ -60,6 +63,10 @@ enum Commands {
 
     /// Probe available nodes, CPU/RAM resources, RTT, and live link bandwidth
     Probe {
+        /// Path to an N-node cluster config file (see cluster.conf.example)
+        #[arg(long)]
+        cluster: Option<PathBuf>,
+
         #[arg(long = "node")]
         node: Vec<String>,
 
@@ -69,11 +76,11 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
     },
 
-    /// Pack an entire directory or drive into a deduplicated, solid-grouped `.sqz` archive across your cluster
+    /// Pack an entire directory or drive into a deduplicated, solid-grouped `.sqz` archive across N nodes
     Pack {
         /// Source directory (or file) to archive
         source: PathBuf,
@@ -81,6 +88,10 @@ enum Commands {
         /// Output `.sqz` archive path
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Path to an N-node cluster config file (see cluster.conf.example)
+        #[arg(long)]
+        cluster: Option<PathBuf>,
 
         /// Exclude top-level folder/file names (repeatable)
         #[arg(long = "exclude")]
@@ -98,9 +109,9 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         block_size: String,
 
-        /// Coordinator hard RAM limit (e.g. 2G, 512M)
-        #[arg(long, default_value = "2G")]
-        mem_limit: String,
+        /// Coordinator hard RAM limit (e.g. 2G, 4G, 512M)
+        #[arg(long)]
+        mem_limit: Option<String>,
 
         #[arg(long = "node")]
         node: Vec<String>,
@@ -114,15 +125,15 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
 
         #[arg(long, default_value = "auto")]
         schedule: String,
 
-        /// Wire pre-shrink codec: auto (zstd1 on Wi-Fi, lz4 on GbE+), zstd1, lz4, none
-        #[arg(long, default_value = "auto")]
-        wire_codec: String,
+        /// Wire pre-shrink codec: auto (zstd1 on Wi-Fi/WAN, lz4 on GbE+), zstd1, lz4, none
+        #[arg(long)]
+        wire_codec: Option<String>,
 
         #[arg(long, default_value_t = false)]
         no_hedge: bool,
@@ -135,8 +146,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_raw_bypass: bool,
 
-        #[arg(long, default_value_t = 2)]
-        streams: usize,
+        #[arg(long)]
+        streams: Option<usize>,
     },
 
     /// Unpack a `.sqz` directory archive in parallel with positional writes & per-slab XXH3 verification
@@ -148,8 +159,12 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        #[arg(long, default_value = "2G")]
-        mem_limit: String,
+        /// Path to an N-node cluster config file
+        #[arg(long)]
+        cluster: Option<PathBuf>,
+
+        #[arg(long)]
+        mem_limit: Option<String>,
 
         #[arg(long = "node")]
         node: Vec<String>,
@@ -163,38 +178,40 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
 
         #[arg(long, default_value = "auto")]
         schedule: String,
 
-        #[arg(long, default_value = "auto")]
-        wire_codec: String,
+        #[arg(long)]
+        wire_codec: Option<String>,
 
         #[arg(long, default_value_t = false)]
         no_hedge: bool,
 
-        #[arg(long, default_value_t = 2)]
-        streams: usize,
+        #[arg(long)]
+        streams: Option<usize>,
     },
 
     /// Inspect metadata, ratio, dedup savings, raw-bypass stats, and file list of a `.sqz` / `.zst` archive
     Inspect {
-        /// Archive path (`.sqz`, `.hsq`, or seekable `.zst`)
         input: PathBuf,
 
-        /// List packed files inside `.sqz` directory archives
         #[arg(short, long, default_value_t = false)]
         list: bool,
     },
 
-    /// Compress a single file across selected local & remote devices
+    /// Compress a single file across any number of local & remote devices
     Compress {
         input: PathBuf,
 
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Path to an N-node cluster config file
+        #[arg(long)]
+        cluster: Option<PathBuf>,
 
         #[arg(long, default_value = "zstd")]
         codec: String,
@@ -209,8 +226,8 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         block_size: String,
 
-        #[arg(long, default_value = "2G")]
-        mem_limit: String,
+        #[arg(long)]
+        mem_limit: Option<String>,
 
         #[arg(long = "node")]
         node: Vec<String>,
@@ -224,14 +241,14 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
 
         #[arg(long, default_value = "auto")]
         schedule: String,
 
-        #[arg(long, default_value = "auto")]
-        wire_codec: String,
+        #[arg(long)]
+        wire_codec: Option<String>,
 
         #[arg(long, default_value_t = false)]
         no_hedge: bool,
@@ -242,8 +259,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_raw_bypass: bool,
 
-        #[arg(long, default_value_t = 2)]
-        streams: usize,
+        #[arg(long)]
+        streams: Option<usize>,
     },
 
     /// Decompress a `.zst` (seekable) or `.sqz` archive in parallel across selected devices
@@ -253,8 +270,12 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        #[arg(long, default_value = "2G")]
-        mem_limit: String,
+        /// Path to an N-node cluster config file
+        #[arg(long)]
+        cluster: Option<PathBuf>,
+
+        #[arg(long)]
+        mem_limit: Option<String>,
 
         #[arg(long = "node")]
         node: Vec<String>,
@@ -268,14 +289,14 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
 
         #[arg(long, default_value = "auto")]
         schedule: String,
 
-        #[arg(long, default_value = "auto")]
-        wire_codec: String,
+        #[arg(long)]
+        wire_codec: Option<String>,
 
         #[arg(long, default_value_t = false)]
         no_hedge: bool,
@@ -283,8 +304,8 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         verify: bool,
 
-        #[arg(long, default_value_t = 2)]
-        streams: usize,
+        #[arg(long)]
+        streams: Option<usize>,
     },
 
     /// Run a head-to-head cluster benchmark (local-only vs full cluster) with BLAKE3 round-trip verification
@@ -293,6 +314,10 @@ enum Commands {
 
         #[arg(long)]
         workdir: Option<PathBuf>,
+
+        /// Path to an N-node cluster config file
+        #[arg(long)]
+        cluster: Option<PathBuf>,
 
         #[arg(long, default_value = "zstd")]
         codec: String,
@@ -312,36 +337,112 @@ enum Commands {
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        #[arg(long)]
+        security: Option<String>,
 
-        #[arg(long, default_value = "auto")]
-        wire_codec: String,
+        #[arg(long)]
+        wire_codec: Option<String>,
 
-        #[arg(long, default_value_t = 2)]
-        streams: usize,
+        #[arg(long)]
+        streams: Option<usize>,
 
-        #[arg(long, default_value = "2G")]
-        mem_limit: String,
+        #[arg(long)]
+        mem_limit: Option<String>,
     },
 
     /// Measure raw multi-stream TCP + AEAD bidirectional wire throughput to remote workers
     NetBench {
+        /// Path to an N-node cluster config file
         #[arg(long)]
-        nodes: String,
+        cluster: Option<PathBuf>,
 
-        #[arg(long, env = "SQUIZ_TOKEN")]
+        /// Comma-separated remote host:port targets
+        #[arg(long)]
+        nodes: Option<String>,
+
+        /// Shared auth token
+        #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        #[arg(long, default_value = "aead")]
-        security: String,
+        /// Security mode: aead or auth-only
+        #[arg(long)]
+        security: Option<String>,
 
-        #[arg(long, default_value_t = 4)]
-        streams: usize,
+        /// Parallel TCP streams per node
+        #[arg(long)]
+        streams: Option<usize>,
 
+        /// One-way MiB to transmit per node (bidirectional = 2x)
         #[arg(long, default_value_t = 32)]
         mib: usize,
     },
+}
+
+struct ResolvedCluster {
+    specs: Vec<NodeSpec>,
+    token: String,
+    security: SecurityMode,
+    wire_codec: WireCodec,
+    mem_bytes: usize,
+    streams: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_cluster(
+    cluster_path: Option<&PathBuf>,
+    node_args: &[String],
+    nodes_csv: Option<&str>,
+    cli_token: &str,
+    cli_security: Option<&str>,
+    cli_wire_codec: Option<&str>,
+    cli_mem_limit: Option<&str>,
+    cli_streams: Option<usize>,
+    default_streams: usize,
+) -> Result<ResolvedCluster> {
+    let file_cfg = match cluster_path {
+        Some(p) => load_cluster_file(p)?,
+        None => ClusterFileConfig::default(),
+    };
+
+    let streams = cli_streams
+        .or(file_cfg.streams)
+        .unwrap_or(default_streams)
+        .clamp(1, 8);
+    let token = if !cli_token.is_empty() {
+        cli_token.to_string()
+    } else {
+        file_cfg.token.unwrap_or_default()
+    };
+    let sec_str = cli_security
+        .map(|s| s.to_string())
+        .or(file_cfg.security)
+        .unwrap_or_else(|| "aead".to_string());
+    let security = SecurityMode::from_str(&sec_str)?;
+
+    let wire_str = cli_wire_codec
+        .map(|s| s.to_string())
+        .or(file_cfg.wire_codec)
+        .unwrap_or_else(|| "auto".to_string());
+    let wire_codec = WireCodec::from_str(&wire_str)?;
+
+    let mem_str = cli_mem_limit
+        .map(|s| s.to_string())
+        .or(file_cfg.mem_limit)
+        .unwrap_or_else(|| "2G".to_string());
+    let mem_bytes = parse_size(&mem_str)?;
+
+    let mut all_nodes = file_cfg.nodes;
+    all_nodes.extend_from_slice(node_args);
+
+    let specs = collect_node_specs(&all_nodes, nodes_csv, streams)?;
+    Ok(ResolvedCluster {
+        specs,
+        token,
+        security,
+        wire_codec,
+        mem_bytes,
+        streams,
+    })
 }
 
 fn collect_node_specs(node_args: &[String], nodes_csv: Option<&str>, default_streams: usize) -> Result<Vec<NodeSpec>> {
@@ -373,7 +474,7 @@ fn collect_node_specs(node_args: &[String], nodes_csv: Option<&str>, default_str
 }
 
 fn print_probe_table(probed: &[resource::ProbedNode]) {
-    println!("\n=== squiz-archive Cluster Probe ===");
+    println!("\n=== squiz-archive Cluster Probe ({} node(s)) ===", probed.len());
     println!(
         "{:<24} {:<10} {:<14} {:<32} {:<10} {:<12} {:<14}",
         "TARGET", "STATUS", "OS/ARCH", "CPU", "THREADS", "MEM (MAX)", "LINK"
@@ -431,14 +532,24 @@ fn main() -> Result<()> {
         }
 
         Commands::Probe {
+            cluster,
             node,
             nodes,
             token,
             security,
         } => {
-            let specs = collect_node_specs(&node, nodes.as_deref(), 2)?;
-            let sec = SecurityMode::from_str(&security)?;
-            let probed = probe_nodes(&specs, &token, sec);
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                None,
+                None,
+                None,
+                2,
+            )?;
+            let probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             print_probe_table(&probed);
             Ok(())
         }
@@ -448,6 +559,7 @@ fn main() -> Result<()> {
         Commands::Pack {
             source,
             output,
+            cluster,
             exclude,
             codec,
             level,
@@ -472,17 +584,24 @@ fn main() -> Result<()> {
             } else {
                 Some(parse_size(&block_size)?)
             };
-            let mem_bytes = parse_size(&mem_limit)?;
-            let sec = SecurityMode::from_str(&security)?;
             let sched = ScheduleMode::from_str(&schedule)?;
-            let wcodec = WireCodec::from_str(&wire_codec)?;
-            let specs = collect_node_specs(&node, nodes.as_deref(), streams)?;
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                wire_codec.as_deref(),
+                mem_limit.as_deref(),
+                streams,
+                2,
+            )?;
 
-            if specs.iter().any(|s| !s.is_local) && token.is_empty() {
-                bail!("remote nodes configured: provide --token or SQUIZ_TOKEN");
+            if rc.specs.iter().any(|s| !s.is_local) && rc.token.is_empty() {
+                bail!("remote nodes configured: provide --token, SQUIZ_TOKEN, or token= in --cluster");
             }
 
-            let mut probed = probe_nodes(&specs, &token, sec);
+            let mut probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             if pick {
                 interactive_pick(&mut probed)?;
             } else {
@@ -496,14 +615,14 @@ fn main() -> Result<()> {
                 codec: codec_id,
                 level,
                 block_size: blk,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: sched,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: !no_hedge,
                 dedup: !no_dedup,
                 entropy_bypass: !no_raw_bypass,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -513,6 +632,7 @@ fn main() -> Result<()> {
         Commands::Unpack {
             input,
             output,
+            cluster,
             mem_limit,
             node,
             nodes,
@@ -524,28 +644,35 @@ fn main() -> Result<()> {
             no_hedge,
             streams,
         } => {
-            let mem_bytes = parse_size(&mem_limit)?;
-            let sec = SecurityMode::from_str(&security)?;
             let sched = ScheduleMode::from_str(&schedule)?;
-            let wcodec = WireCodec::from_str(&wire_codec)?;
-            let specs = collect_node_specs(&node, nodes.as_deref(), streams)?;
-            if specs.iter().any(|s| !s.is_local) && token.is_empty() {
-                bail!("remote nodes configured: provide --token or SQUIZ_TOKEN");
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                wire_codec.as_deref(),
+                mem_limit.as_deref(),
+                streams,
+                2,
+            )?;
+            if rc.specs.iter().any(|s| !s.is_local) && rc.token.is_empty() {
+                bail!("remote nodes configured: provide --token, SQUIZ_TOKEN, or token= in --cluster");
             }
-            let mut probed = probe_nodes(&specs, &token, sec);
+            let mut probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             if pick {
                 interactive_pick(&mut probed)?;
             }
             run_unpack(DecompressParams {
                 input_path: &input,
                 output_path: &output,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: sched,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: !no_hedge,
                 verify: true,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -555,6 +682,7 @@ fn main() -> Result<()> {
         Commands::Compress {
             input,
             output,
+            cluster,
             codec,
             level,
             format,
@@ -606,17 +734,24 @@ fn main() -> Result<()> {
             } else {
                 Some(parse_size(&block_size)?)
             };
-            let mem_bytes = parse_size(&mem_limit)?;
-            let sec = SecurityMode::from_str(&security)?;
             let sched = ScheduleMode::from_str(&schedule)?;
-            let wcodec = WireCodec::from_str(&wire_codec)?;
-            let specs = collect_node_specs(&node, nodes.as_deref(), streams)?;
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                wire_codec.as_deref(),
+                mem_limit.as_deref(),
+                streams,
+                2,
+            )?;
 
-            if specs.iter().any(|s| !s.is_local) && token.is_empty() {
-                bail!("remote nodes configured: provide --token or SQUIZ_TOKEN");
+            if rc.specs.iter().any(|s| !s.is_local) && rc.token.is_empty() {
+                bail!("remote nodes configured: provide --token, SQUIZ_TOKEN, or token= in --cluster");
             }
 
-            let mut probed = probe_nodes(&specs, &token, sec);
+            let mut probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             if pick {
                 interactive_pick(&mut probed)?;
             } else {
@@ -630,14 +765,14 @@ fn main() -> Result<()> {
                 level,
                 format: container_fmt,
                 block_size: blk,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: sched,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: !no_hedge,
                 dedup: !no_dedup,
                 entropy_bypass: !no_raw_bypass,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -647,6 +782,7 @@ fn main() -> Result<()> {
         Commands::Decompress {
             input,
             output,
+            cluster,
             mem_limit,
             node,
             nodes,
@@ -659,17 +795,24 @@ fn main() -> Result<()> {
             verify,
             streams,
         } => {
-            let mem_bytes = parse_size(&mem_limit)?;
-            let sec = SecurityMode::from_str(&security)?;
             let sched = ScheduleMode::from_str(&schedule)?;
-            let wcodec = WireCodec::from_str(&wire_codec)?;
-            let specs = collect_node_specs(&node, nodes.as_deref(), streams)?;
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                wire_codec.as_deref(),
+                mem_limit.as_deref(),
+                streams,
+                2,
+            )?;
 
-            if specs.iter().any(|s| !s.is_local) && token.is_empty() {
-                bail!("remote nodes configured: provide --token or SQUIZ_TOKEN");
+            if rc.specs.iter().any(|s| !s.is_local) && rc.token.is_empty() {
+                bail!("remote nodes configured: provide --token, SQUIZ_TOKEN, or token= in --cluster");
             }
 
-            let mut probed = probe_nodes(&specs, &token, sec);
+            let mut probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             if pick {
                 interactive_pick(&mut probed)?;
             }
@@ -677,13 +820,13 @@ fn main() -> Result<()> {
             run_decompress(DecompressParams {
                 input_path: &input,
                 output_path: &output,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: sched,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: !no_hedge,
                 verify,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -693,6 +836,7 @@ fn main() -> Result<()> {
         Commands::Bench {
             input,
             workdir,
+            cluster,
             codec,
             level,
             block_size,
@@ -711,11 +855,18 @@ fn main() -> Result<()> {
             } else {
                 Some(parse_size(&block_size)?)
             };
-            let mem_bytes = parse_size(&mem_limit)?;
-            let sec = SecurityMode::from_str(&security)?;
-            let wcodec = WireCodec::from_str(&wire_codec)?;
-            let specs = collect_node_specs(&node, nodes.as_deref(), streams)?;
-            let probed = probe_nodes(&specs, &token, sec);
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &node,
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                wire_codec.as_deref(),
+                mem_limit.as_deref(),
+                streams,
+                2,
+            )?;
+            let probed = probe_nodes(&rc.specs, &rc.token, rc.security);
             print_probe_table(&probed);
 
             let dir = workdir.unwrap_or_else(|| {
@@ -745,19 +896,19 @@ fn main() -> Result<()> {
                 level,
                 format: fmt,
                 block_size: blk,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: ScheduleMode::LocalOnly,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: false,
                 dedup: false,
                 entropy_bypass: false,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
 
-            println!(">>> [2/4] CLUSTER Compress ({} L{}, sec={:?}, wire={:?}) ...", codec_id.name(), level, sec, wcodec);
+            println!(">>> [2/4] CLUSTER Compress ({} L{}, sec={:?}, wire={:?}) ...", codec_id.name(), level, rc.security, rc.wire_codec);
             let cluster_c = run_compress(CompressParams {
                 input_path: &input,
                 output_path: &cluster_arc,
@@ -765,14 +916,14 @@ fn main() -> Result<()> {
                 level,
                 format: fmt,
                 block_size: blk,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: ScheduleMode::ForceAll,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: true,
                 dedup: false,
                 entropy_bypass: false,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -781,13 +932,13 @@ fn main() -> Result<()> {
             let local_d = run_decompress(DecompressParams {
                 input_path: &cluster_arc,
                 output_path: &restored,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: ScheduleMode::LocalOnly,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: false,
                 verify: true,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -796,13 +947,13 @@ fn main() -> Result<()> {
             let cluster_d = run_decompress(DecompressParams {
                 input_path: &cluster_arc,
                 output_path: &restored,
-                mem_limit_bytes: mem_bytes,
-                security: sec,
+                mem_limit_bytes: rc.mem_bytes,
+                security: rc.security,
                 schedule: ScheduleMode::Auto,
-                wire_codec: wcodec,
+                wire_codec: rc.wire_codec,
                 hedge: true,
                 verify: true,
-                token: &token,
+                token: &rc.token,
                 nodes: &probed,
                 quiet: false,
             })?;
@@ -821,8 +972,8 @@ fn main() -> Result<()> {
                 "  Codec / Level     : {} L{} | Security: {:?} | Wire: {:?} | BLAKE3: VERIFIED EXACT MATCH",
                 codec_id.name(),
                 level,
-                sec,
-                wcodec
+                rc.security,
+                rc.wire_codec
             );
             println!(
                 "  Compress Local    : {:7.3} s ({:7.2} MiB/s)",
@@ -849,15 +1000,28 @@ fn main() -> Result<()> {
         }
 
         Commands::NetBench {
+            cluster,
             nodes,
             token,
             security,
             streams,
             mib,
         } => {
-            let sec = SecurityMode::from_str(&security)?;
-            let specs = collect_node_specs(&[], Some(&nodes), streams)?;
-            run_net_bench(&specs, &token, sec, mib, streams)
+            let rc = resolve_cluster(
+                cluster.as_ref(),
+                &[],
+                nodes.as_deref(),
+                &token,
+                security.as_deref(),
+                None,
+                None,
+                streams,
+                4,
+            )?;
+            if rc.specs.iter().all(|s| s.is_local) {
+                bail!("net-bench requires at least one remote node via --nodes or --cluster");
+            }
+            run_net_bench(&rc.specs, &rc.token, rc.security, mib, rc.streams)
         }
     }
 }

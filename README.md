@@ -5,8 +5,8 @@
 <h1 align="center">squiz-archive</h1>
 
 <p align="center">
-  <strong>Wi-Fi-Native Distributed HPC Compression & Archival Engine</strong><br/>
-  Pool CPU & RAM across Linux, Windows, macOS, LAN, Tailscale, or Cloud instances into one blazing-fast, hardware-encrypted compression cluster.
+  <strong>Scale to as many devices as you choose — 2 PCs, 10 homelab servers, or 100+ cloud instances across LAN, Tailscale/WireGuard, or the public Internet.</strong><br/>
+  Pool heterogeneous Linux, Windows, and macOS CPU & RAM into one blazing-fast, hardware-encrypted compression cluster.
 </p>
 
 <p align="center">
@@ -46,9 +46,9 @@ Compressing multi-gigabyte datasets, backups, VM images, or CSV/log archives at 
 
 ---
 
-## Verified Real-World Benchmarks (3-PC Heterogeneous Wi-Fi Cluster)
+## Example Benchmarks (3-Node Mixed-OS Wi-Fi Testbed)
 
-Tested live across a 3-machine mixed OS cluster over shared 5 GHz Wi-Fi (64 total threads, 108 GiB RAM):
+`squiz-archive` supports **any number of nodes (`N = 1..100+`)**. As a real-world baseline, we tested a 3-node heterogeneous cluster over shared 5 GHz Wi-Fi (64 threads, 108 GiB RAM):
 - **Coordinator (`node-win`):** Windows 10, Intel i7-9750H (6C / 12T), 16 GiB RAM, NTFS
 - **Worker 1 (`node-ryzen`):** Debian 13, AMD Ryzen 9 7945HX (16C / 32T), 30 GiB RAM
 - **Worker 2 (`node-intel`):** Debian 13 (LAN + Tailscale), Intel i7-12700 (12C / 20T), 62 GiB RAM
@@ -84,34 +84,37 @@ RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq" cargo buil
 
 ---
 
-## Quick Start
+## Quick Start (Any Number of Nodes — LAN, Tailscale, or Public Internet)
 
-### 1. Start Authenticated Workers on Spare PCs / Cloud Instances
+> **Full Step-by-Step Setup Guide (LAN Firewalls, Tailscale/WireGuard Mesh, AWS/Hetzner/GCP Cloud Workers, `systemd` & Windows Services):** see **[`docs/CLUSTER_SETUP.md`](docs/CLUSTER_SETUP.md)** and **[`cluster.conf.example`](cluster.conf.example)**.
+
+### 1. Start Authenticated Workers on Any Number of Machines
 ```bash
 # Linux / macOS / Cloud VM (hard CPU & RAM ceilings enforced by worker)
 squiz-archive worker --bind 0.0.0.0:7878 --token "YOUR_STRONG_SECRET" --max-threads 32 --max-mem 8G
 
 # Over Tailscale / WireGuard (optional --allow-auth-only to skip double encryption)
-squiz-archive worker --bind 0.0.0.0:7878 --token "YOUR_STRONG_SECRET" --max-threads 20 --max-mem 16G --allow-auth-only
+squiz-archive worker --bind "$(tailscale ip -4):7878" --token "YOUR_STRONG_SECRET" --max-threads 20 --max-mem 16G --allow-auth-only
 ```
 
-### 2. Probe Reachable Nodes & Live Resources
+### 2. Define Your N-Node Cluster (`cluster.conf`) & Probe Live Resources
 ```bash
-squiz-archive probe --nodes local,192.168.100.40:7878,100.64.0.10:7878 --token "YOUR_STRONG_SECRET"
+cp cluster.conf.example cluster.conf   # add 2, 10, or 50+ LAN / Tailscale / Cloud nodes
+squiz-archive probe --cluster cluster.conf
 ```
 
 ### 3. Pack an Entire Directory or Drive (`.sqz` with Dedup + Solid Grouping + Raw Bypass)
 ```bash
-# Explicit per-node resource budgets (threads, RAM, optional bandwidth cap)
+# Use your N-node cluster file directly (add --pick / -i to interactively toggle nodes & resources!)
+squiz-archive pack /path/to/data -o /path/to/backup.sqz --cluster cluster.conf --pick
+
+# Or pass explicit per-node resource budgets directly on the CLI (repeat --node as many times as needed):
 squiz-archive pack /path/to/data -o /path/to/backup.sqz \
   --codec zstd --level 12 --block-size 8M --token "YOUR_STRONG_SECRET" \
-  --node local:threads=10,mem=2G \
-  --node 192.168.100.40:7878:threads=32,mem=6G \
-  --node 192.168.100.101:7878:threads=20,mem=8G
-
-# Or launch the interactive CLI device & resource picker (-i / --pick)
-squiz-archive pack /path/to/data -o /path/to/backup.sqz \
-  --nodes local,192.168.100.40:7878,192.168.100.101:7878 --pick --token "YOUR_STRONG_SECRET"
+  --node local:threads=auto,mem=4G \
+  --node 192.168.1.40:7878:threads=32,mem=8G \
+  --node 100.64.0.10:7878:threads=20,mem=16G \
+  --node cloud-worker-1.example.com:7878:threads=64,mem=32G,streams=6,bw=100M
 ```
 
 ### 4. Inspect & Unpack in Parallel
