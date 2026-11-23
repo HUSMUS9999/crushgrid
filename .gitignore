@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.sqz
+*.hsq
+*.zst
+.DS_Store
+Thumbs.db

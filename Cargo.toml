@@ -1,0 +1,41 @@
+[package]
+name = "squiz-archive"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+description = "Wi-Fi-native distributed HPC compression & archival engine (Rust + C/ASM SIMD, Zstd LDM, LZMA2, BLAKE3 dedup, AES-256-GCM)"
+repository = "https://github.com/HUSMUS9999/squiz-archive"
+keywords = ["compression", "distributed", "zstd", "lzma2", "hpc"]
+categories = ["compression", "command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "squiz-archive"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+sysinfo = "0.33"
+libc = "0.2"
+walkdir = "2.5"
+
+# High-performance C / ASM SIMD compression kernels (statically linked, zero DLLs)
+zstd-safe = { version = "7.2", default-features = false, features = ["std", "arrays", "zstdmt"] }
+xz2 = { version = "0.1", features = ["static"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+
+# Zero-overhead hardware-accelerated cryptography & hashing
+blake3 = { version = "1.5", features = ["rayon"] }
+aes-gcm = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
