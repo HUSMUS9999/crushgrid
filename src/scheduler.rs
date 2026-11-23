@@ -622,13 +622,15 @@ fn run_compress_stream(
     let use_entropy_bypass = allow_sqz_smart && params.entropy_bypass;
 
     if !params.quiet {
+        let ldm_tag = if params.codec == CodecId::Zstd { " (LDM)" } else { "" };
         println!(
-            "[squiz-archive] Compress {} ({:.2} MiB) -> {} | codec={} L{} (LDM) | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
+            "[squiz-archive] Compress {} ({:.2} MiB) -> {} | codec={} L{}{} | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
             source_label,
             total_orig_size as f64 / 1048576.0,
             params.output_path.display(),
             params.codec.name(),
             params.level,
+            ldm_tag,
             params.format,
             block_size as f64 / 1048576.0,
             total_chunks,
@@ -721,8 +723,8 @@ fn run_compress_stream(
             ));
         } else {
             let resolved_wire = params.wire_codec.resolve(node.probe_bw_mbps);
-            // Airtime weight in [0.35, 1.0]: fast high-core peer (`hus`) gets full credit ceiling,
-            // slower Wi-Fi peer (`debian`) gets proportionally moderated ceiling so it never starves `hus`!
+            // Airtime weight in [0.35, 1.0]: faster high-core peers get full credit ceilings,
+            // slower peers get proportionally moderated ceilings so they don't starve faster links.
             let airtime_weight = (remote_scores[node_idx] / max_remote_score).clamp(0.35, 1.0);
             worker_handles.push(spawn_remote_worker_node(
                 node_idx,

@@ -1,43 +1,38 @@
-# squiz-archive N-node Cluster Configuration Example
-# Add as many PCs, servers, Tailscale peers, or cloud VMs as you want!
+# squiz-archive N-node cluster configuration
+# Copy to cluster.conf and restrict permissions: chmod 600 cluster.conf
 # Usage:
 #   squiz-archive probe --cluster cluster.conf
-#   squiz-archive pack ./my_data -o ./my_data.sqz --cluster cluster.conf --pick
+#   squiz-archive pack ./data -o ./data.sqz --cluster cluster.conf --pick
 
-# Generate a strong 256-bit shared token with: openssl rand -hex 32
+# Generate with: openssl rand -hex 32
 token = REPLACE_WITH_YOUR_64_CHAR_HEX_TOKEN
 
-# Security mode:
-#   aead      = Mutual BLAKE3 auth + hardware AES-256-GCM encryption (REQUIRED over public Internet / untrusted LAN)
-#   auth-only = Mutual BLAKE3 auth + XXH3 integrity (optional inside already-encrypted Tailscale/WireGuard VPNs)
+# aead      = mutual BLAKE3 auth + per-session AES-256-GCM (default; required over public Internet)
+# auth-only = mutual BLAKE3 auth + XXH3 integrity (optional inside WireGuard/Tailscale tunnels)
 security = aead
 
-# Wire pre-shrink:
-#   auto  = zstd L1 on Wi-Fi/WAN (<100 MiB/s), lz4 on fast Ethernet/Cloud VPC (>=100 MiB/s)
-#   zstd1 = force zstd L1 (best for Wi-Fi & Internet WAN links)
-#   lz4   = force lz4 (best for 1GbE/10GbE/cloud VPCs)
-#   none  = disable
+# auto  = zstd1 on links <100 MiB/s (Wi-Fi/WAN), lz4 on links >=100 MiB/s (GbE/VPC)
+# zstd1 = force zstd level 1 wire pre-shrink
+# lz4   = force lz4 wire pre-shrink
+# none  = disable wire pre-shrink
 wire_codec = auto
 
-# Coordinator hard RAM ceiling
+# Coordinator hard RAM limit (default: 2G)
 mem_limit = 4G
 
-# Default parallel TCP streams per remote worker (2-4 for Wi-Fi/LAN, 4-8 for high-RTT Internet/Cloud WAN)
+# Default parallel TCP streams per remote node (clamped to 1..=8)
 streams = 2
 
-# --- Local Coordinator Node ---
-# threads=auto reserves 1-2 threads for TCP/AEAD/disk I/O when remote nodes are active
+# Local coordinator (threads=auto reserves 1-2 threads for I/O when remote nodes are active)
 node = local:threads=auto,mem=4G
 
-# --- LAN Nodes (Home / Office Ethernet or Wi-Fi) ---
+# LAN nodes
 node = 192.168.1.40:7878:threads=max,mem=8G,streams=2
 node = 192.168.1.41:7878:threads=75%,mem=4G,streams=2
 
-# --- Tailscale / WireGuard Mesh Nodes (Zero Port-Forwarding Across Internet) ---
+# Tailscale / WireGuard peers
 # node = 100.64.0.10:7878:threads=max,mem=16G,streams=3
-# node = 100.64.0.11:7878:threads=16,mem=8G,streams=3
 
-# --- Direct Public Internet / Cloud Instances (AWS, Hetzner, GCP, DigitalOcean) ---
-# Tip: Use streams=4..8 on higher-RTT WAN links and optional bw= cap to protect office uplink
-# node = worker1.example.com:7878:threads=64,mem=32G,streams=6,bw=100M
-# node = 203.0.113.50:7878:threads=32,mem=16G,streams=6
+# Public Internet / cloud workers
+# Note: bw= is in bytes/sec (10M = 10 MiB/s ~= 84 Mbps)
+# node = worker1.example.com:7878:threads=64,mem=32G,streams=6,bw=10M

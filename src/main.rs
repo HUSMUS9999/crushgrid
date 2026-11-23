@@ -29,7 +29,7 @@ use worker::{WorkerConfig, run_worker};
 #[command(
     name = "squiz-archive",
     version,
-    about = "N-node distributed HPC compression & archival engine for LAN, Tailscale, and Cloud/Internet (Rust + C/ASM SIMD, Zstd LDM, LZMA2, BLAKE3 dedup, AES-256-GCM)"
+    about = "Distributed multi-node compression and archival CLI for LAN, VPN, and cloud hosts"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -301,8 +301,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_hedge: bool,
 
-        #[arg(long, default_value_t = true)]
-        verify: bool,
+        /// Skip whole-file BLAKE3 verification on single-file .sqz decompress
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
 
         #[arg(long)]
         streams: Option<usize>,
@@ -355,6 +356,9 @@ enum Commands {
         /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        #[arg(long = "node")]
+        node: Vec<String>,
 
         /// Comma-separated remote host:port targets
         #[arg(long)]
@@ -792,7 +796,7 @@ fn main() -> Result<()> {
             schedule,
             wire_codec,
             no_hedge,
-            verify,
+            no_verify,
             streams,
         } => {
             let sched = ScheduleMode::from_str(&schedule)?;
@@ -825,7 +829,7 @@ fn main() -> Result<()> {
                 schedule: sched,
                 wire_codec: rc.wire_codec,
                 hedge: !no_hedge,
-                verify,
+                verify: !no_verify,
                 token: &rc.token,
                 nodes: &probed,
                 quiet: false,
@@ -1001,6 +1005,7 @@ fn main() -> Result<()> {
 
         Commands::NetBench {
             cluster,
+            node,
             nodes,
             token,
             security,
@@ -1009,7 +1014,7 @@ fn main() -> Result<()> {
         } => {
             let rc = resolve_cluster(
                 cluster.as_ref(),
-                &[],
+                &node,
                 nodes.as_deref(),
                 &token,
                 security.as_deref(),

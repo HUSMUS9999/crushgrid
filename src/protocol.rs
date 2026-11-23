@@ -362,13 +362,9 @@ impl StreamCipher {
     }
 }
 
-/// Constant-time 32-byte comparison to avoid timing side channels during auth.
+/// Constant-time 32-byte MAC comparison via `blake3::Hash` (backed by `constant_time_eq`).
 fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    blake3::Hash::from(*a) == blake3::Hash::from(*b)
 }
 
 fn psk_key(token: &str) -> [u8; 32] {
@@ -528,7 +524,7 @@ pub fn client_handshake(
         &hello,
     )?;
 
-    // 2. Receive HelloServer: [server_nonce:32][server_mac:32][caps...]
+    // 2. Receive HelloServer: [server_nonce:32][server_mac:32] (no host metadata leaked pre-auth!)
     let mut buf = Vec::new();
     let hdr = plain
         .read_frame_into(stream, &mut buf, 64 * 1024)
@@ -536,7 +532,7 @@ pub fn client_handshake(
     if hdr.msg_type == MsgType::Error {
         bail!("worker rejected connection: {}", String::from_utf8_lossy(&buf));
     }
-    if hdr.msg_type != MsgType::HelloServer || buf.len() < 64 {
+    if hdr.msg_type != MsgType::HelloServer || buf.len() != 64 {
         bail!("unexpected HelloServer frame");
     }
     let server_nonce: [u8; 32] = buf[0..32].try_into().unwrap();
@@ -545,7 +541,6 @@ pub fn client_handshake(
     if !ct_eq_32(&server_mac, &expected_server_mac) {
         bail!("worker authentication failed (mismatched --token or MITM)");
     }
-    let caps = WorkerCaps::decode(&buf[64..])?;
 
     // 3. Send AuthClient: [client_mac:32]
     let client_mac = compute_mac(&psk, b"client-auth", &client_nonce, &server_nonce, mode.as_u8(), stream_id);
@@ -564,24 +559,28 @@ pub fn client_handshake(
         &client_mac,
     )?;
 
-    // 4. Read AuthOk
-    let hdr = plain.read_frame_into(stream, &mut buf, 4096)?;
+    // 4. Derive session cipher and read authenticated/encrypted AuthOk carrying WorkerCaps
+    let session_key = derive_session_key(&psk, &client_nonce, &server_nonce, stream_id);
+    let mut cipher = StreamCipher::new(session_key, mode, stream_id, true);
+
+    let hdr = cipher.read_frame_into(stream, &mut buf, 64 * 1024)?;
     if hdr.msg_type == MsgType::Error {
         bail!("worker auth failed: {}", String::from_utf8_lossy(&buf));
     }
     if hdr.msg_type != MsgType::AuthOk {
         bail!("expected AuthOk, got {:?}", hdr.msg_type);
     }
+    let caps = WorkerCaps::decode(&buf)?;
 
     // Clear short handshake timeout for streaming jobs
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
 
-    let session_key = derive_session_key(&psk, &client_nonce, &server_nonce, stream_id);
-    Ok((StreamCipher::new(session_key, mode, stream_id, true), caps))
+    Ok((cipher, caps))
 }
 
 /// Server-side mutual BLAKE3 handshake -> returns (StreamCipher, requested_threads, requested_mem_mb, stream_id).
+/// WorkerCaps is sent ONLY after mutual authentication succeeds, encrypted under the session cipher.
 pub fn server_handshake(
     stream: &mut TcpStream,
     token: &str,
@@ -625,16 +624,14 @@ pub fn server_handshake(
         bail!("client attempted auth-only while worker requires AEAD");
     }
 
-    // 2. Send HelloServer
+    // 2. Send HelloServer: [server_nonce:32][server_mac:32] (no pre-auth host info disclosure)
     let mut server_nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut server_nonce);
     let server_mac = compute_mac(&psk, b"server-auth", &client_nonce, &server_nonce, mode.as_u8(), stream_id);
-    let caps_bytes = caps.encode();
 
-    let mut resp = Vec::with_capacity(64 + caps_bytes.len());
+    let mut resp = Vec::with_capacity(64);
     resp.extend_from_slice(&server_nonce);
     resp.extend_from_slice(&server_mac);
-    resp.extend_from_slice(&caps_bytes);
     plain.write_frame_slice(
         stream,
         FrameHeader {
@@ -675,8 +672,11 @@ pub fn server_handshake(
         bail!("client auth MAC mismatch");
     }
 
-    // 4. Send AuthOk
-    plain.write_frame_slice(
+    // 4. Derive session cipher and send WorkerCaps encrypted inside AuthOk
+    let session_key = derive_session_key(&psk, &client_nonce, &server_nonce, stream_id);
+    let mut cipher = StreamCipher::new(session_key, mode, stream_id, false);
+    let mut caps_bytes = caps.encode();
+    cipher.write_frame(
         stream,
         FrameHeader {
             msg_type: MsgType::AuthOk,
@@ -684,23 +684,17 @@ pub fn server_handshake(
             level: 0,
             flags: 0,
             chunk_id: 0,
-            orig_len: 0,
-            payload_len: 0,
+            orig_len: caps_bytes.len() as u32,
+            payload_len: caps_bytes.len() as u32,
             xxh3: 0,
         },
-        &[],
+        &mut caps_bytes,
     )?;
 
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
 
-    let session_key = derive_session_key(&psk, &client_nonce, &server_nonce, stream_id);
-    Ok((
-        StreamCipher::new(session_key, mode, stream_id, false),
-        req_threads,
-        req_mem_mb,
-        stream_id,
-    ))
+    Ok((cipher, req_threads, req_mem_mb, stream_id))
 }
 
 #[derive(Debug, Clone)]

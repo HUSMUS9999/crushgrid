@@ -117,7 +117,7 @@ pub fn build_pack_plan(
         let first_lower = first_comp.to_ascii_lowercase();
         if matches!(
             first_lower.as_str(),
-            "$recycle.bin" | "system volume information" | "recovery" | "windowsapps" | "hpc-squizze-test"
+            "$recycle.bin" | "system volume information" | "recovery" | "windowsapps"
         ) {
             skipped_count += 1;
             continue;

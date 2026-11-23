@@ -287,7 +287,7 @@ pub struct ProbedNode {
 /// Interactive CLI resource picker: shows live probed cluster table and lets user choose
 /// which devices to enable plus exact threads/RAM/bandwidth caps for each.
 pub fn interactive_pick(probed: &mut [ProbedNode]) -> Result<()> {
-    println!("\n=== hpc-squizze Interactive Device & Resource Picker ===");
+    println!("\n=== squiz-archive Interactive Device & Resource Picker ===");
     println!(
         "{:<3} {:<22} {:<14} {:<28} {:<10} {:<10} {:<10}",
         "#", "NODE", "OS/ARCH", "CPU", "THREADS", "AVAIL RAM", "LINK"
