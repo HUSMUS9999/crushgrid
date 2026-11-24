@@ -1,11 +1,11 @@
 [package]
 name = "squiz-archive"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
-description = "Distributed multi-node compression and archival CLI (Zstd, LZMA2, LZ4) with BLAKE3 dedup and AES-256-GCM"
+description = "Distributed multi-node compression and archival CLI (Zstd, Bzip3, PPMd, LZMA2+BCJ, LZ4) with BLAKE3 dedup and AES-256-GCM"
 repository = "https://github.com/HUSMUS9999/squiz-archive"
-keywords = ["compression", "distributed", "zstd", "lzma2", "hpc"]
+keywords = ["compression", "distributed", "zstd", "bzip3", "lzma2"]
 categories = ["compression", "command-line-utilities", "network-programming"]
 
 [[bin]]
@@ -22,9 +22,11 @@ sysinfo = "0.33"
 libc = "0.2"
 walkdir = "2.5"
 
-# High-performance C / ASM SIMD compression kernels (statically linked, zero DLLs)
+# Compression codecs (libzstd, liblzma, libbzip3 statically bundled; ppmd & lz4 pure Rust)
 zstd-safe = { version = "7.2", default-features = false, features = ["std", "arrays", "zstdmt"] }
 xz2 = { version = "0.1", features = ["static"] }
+bzip3 = { version = "0.13", default-features = false, features = ["bundled"] }
+ppmd-rust = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 
 # Cryptography and hashing

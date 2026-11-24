@@ -10,7 +10,7 @@ mod worker;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use codec::CodecId;
+use codec::{CodecId, Preset};
 use container::ContainerFormat;
 use protocol::{DEFAULT_MAX_FRAME_BYTES, SecurityMode, WireCodec};
 use resource::{
@@ -22,14 +22,20 @@ use scheduler::{
     probe_nodes, run_compress, run_decompress, run_inspect, run_net_bench, run_pack, run_unpack,
 };
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use worker::{WorkerConfig, run_worker};
 
 #[derive(Parser)]
 #[command(
     name = "squiz-archive",
     version,
-    about = "Distributed multi-node compression and archival CLI for LAN, VPN, and cloud hosts"
+    about = "Distributed multi-node compression and archival CLI for LAN, VPN, and cloud hosts",
+    long_about = "Distributed multi-node compression and archival CLI.\n\n\
+Presets (no codec knowledge required):\n  \
+  fast      Maximum speed (Zstd L3)\n  \
+  balanced  Everyday speed and ratio (Zstd L9 + LDM, default)\n  \
+  small     High ratio, fast multi-codec (Bzip3 on text/CSV, LZMA2+BCJ on binaries, LZMA2 L6 on mixed)\n  \
+  max       Smallest archive (Bzip3 16M on text/code, LZMA2+BCJ L9 on binaries, LZMA2 L9 on mixed)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,7 +50,7 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:7878")]
         bind: SocketAddr,
 
-        /// Shared authentication token (or env SQUIZ_TOKEN)
+        /// Shared authentication token (recommended: set SQUIZ_TOKEN env var instead of CLI arg)
         #[arg(long, env = "SQUIZ_TOKEN")]
         token: String,
 
@@ -80,16 +86,17 @@ enum Commands {
         security: Option<String>,
     },
 
-    /// Pack an entire directory or drive into a deduplicated, solid-grouped `.sqz` archive across N nodes
+    /// Pack a directory or file tree into a deduplicated, multi-codec `.sqz` archive
+    #[command(visible_aliases = ["archive", "zip"])]
     Pack {
         /// Source directory (or file) to archive
         source: PathBuf,
 
-        /// Output `.sqz` archive path
+        /// Output `.sqz` archive path (defaults to `<source>.sqz`)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file (see cluster.conf.example)
+        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
 
@@ -97,15 +104,19 @@ enum Commands {
         #[arg(long = "exclude")]
         exclude: Vec<String>,
 
-        /// Codec: zstd (default, with LDM), lzma2, lz4
-        #[arg(long, default_value = "zstd")]
-        codec: String,
+        /// Human-friendly compression preset: fast, balanced (default), small, max
+        #[arg(short = 'm', long, default_value = "balanced")]
+        preset: String,
 
-        /// Compression level (zstd: 1..22, lzma2: 0..9, lz4: 1..12)
+        /// Override codec: auto, zstd, bzip3, ppmd, lzma2, lzma2-bcj, lz4
+        #[arg(long)]
+        codec: Option<String>,
+
+        /// Override codec level (zstd: 1..22, lzma2/bcj: 0..9, bzip3: 1..32 MiB, ppmd: 4..12)
         #[arg(short, long)]
         level: Option<i32>,
 
-        /// Block size (e.g. 4M, 8M) or 'auto'
+        /// Block size (e.g. 4M, 8M, 16M) or 'auto'
         #[arg(long, default_value = "auto")]
         block_size: String,
 
@@ -119,6 +130,7 @@ enum Commands {
         #[arg(long)]
         nodes: Option<String>,
 
+        /// Launch interactive CLI device and resource picker
         #[arg(short = 'i', long, default_value_t = false)]
         pick: bool,
 
@@ -131,7 +143,7 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         schedule: String,
 
-        /// Wire pre-shrink codec: auto (zstd1 on Wi-Fi/WAN, lz4 on GbE+), zstd1, lz4, none
+        /// Wire pre-shrink codec: auto (zstd1 on links <100 MiB/s, lz4 on >=100 MiB/s), zstd1, lz4, none
         #[arg(long)]
         wire_codec: Option<String>,
 
@@ -150,14 +162,15 @@ enum Commands {
         streams: Option<usize>,
     },
 
-    /// Unpack a `.sqz` directory archive in parallel with positional writes & per-slab XXH3 verification
+    /// Extract a `.sqz` directory archive in parallel with positional writes & per-slab XXH3 verification
+    #[command(visible_aliases = ["extract", "unzip"])]
     Unpack {
         /// Input `.sqz` archive path
         input: PathBuf,
 
-        /// Destination directory to extract into
+        /// Destination directory (defaults to archive stem in current directory)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Path to an N-node cluster config file
         #[arg(long)]
@@ -194,7 +207,7 @@ enum Commands {
         streams: Option<usize>,
     },
 
-    /// Inspect metadata, ratio, dedup savings, raw-bypass stats, and file list of a `.sqz` / `.zst` archive
+    /// Inspect metadata, ratio, per-codec breakdown, dedup savings, and file list of an archive
     Inspect {
         input: PathBuf,
 
@@ -213,13 +226,18 @@ enum Commands {
         #[arg(long)]
         cluster: Option<PathBuf>,
 
-        #[arg(long, default_value = "zstd")]
-        codec: String,
+        /// Human-friendly compression preset: fast, balanced (default), small, max
+        #[arg(short = 'm', long, default_value = "balanced")]
+        preset: String,
+
+        /// Override codec: auto, zstd, bzip3, ppmd, lzma2, lzma2-bcj, lz4
+        #[arg(long)]
+        codec: Option<String>,
 
         #[arg(short, long)]
         level: Option<i32>,
 
-        /// Container format: auto, zst (standard Zstd Seekable), or sqz (dedup + raw bypass + BLAKE3)
+        /// Container format: auto, zst (standard Zstd Seekable), or sqz (multi-codec + dedup + BLAKE3)
         #[arg(long, default_value = "auto")]
         format: String,
 
@@ -263,12 +281,13 @@ enum Commands {
         streams: Option<usize>,
     },
 
-    /// Decompress a `.zst` (seekable) or `.sqz` archive in parallel across selected devices
+    /// Decompress a seekable `.zst` or `.sqz` archive in parallel across selected devices
     Decompress {
         input: PathBuf,
 
+        /// Output file path (defaults to stripping `.sqz`/`.zst` extension)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Path to an N-node cluster config file
         #[arg(long)]
@@ -320,8 +339,13 @@ enum Commands {
         #[arg(long)]
         cluster: Option<PathBuf>,
 
-        #[arg(long, default_value = "zstd")]
-        codec: String,
+        /// Compression preset: fast, balanced, small, max
+        #[arg(short = 'm', long, default_value = "balanced")]
+        preset: String,
+
+        /// Override codec: auto, zstd, bzip3, ppmd, lzma2, lzma2-bcj, lz4
+        #[arg(long)]
+        codec: Option<String>,
 
         #[arg(short, long)]
         level: Option<i32>,
@@ -380,6 +404,51 @@ enum Commands {
         #[arg(long, default_value_t = 32)]
         mib: usize,
     },
+}
+
+fn resolve_preset_codec(
+    preset_str: &str,
+    codec_opt: Option<&str>,
+    level_opt: Option<i32>,
+) -> Result<(Preset, CodecId, i32, bool)> {
+    let preset = Preset::from_str(preset_str)?;
+    let (def_codec, def_level, def_auto) = preset.default_codec_and_level();
+    match codec_opt {
+        None => Ok((preset, def_codec, level_opt.unwrap_or(def_level), def_auto)),
+        Some(c) if c.eq_ignore_ascii_case("auto") => {
+            Ok((preset, def_codec, level_opt.unwrap_or(def_level), true))
+        }
+        Some(c) => {
+            let cid = CodecId::from_name(c)?;
+            let lvl = cid.clamp_level(level_opt.unwrap_or_else(|| cid.default_level()));
+            Ok((preset, cid, lvl, false))
+        }
+    }
+}
+
+fn default_pack_output(source: &Path) -> PathBuf {
+    let name = source
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "archive".to_string());
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{}.sqz", name))
+}
+
+fn default_extract_output(input: &Path, is_dir: bool) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if is_dir { "extracted".into() } else { "output.bin".into() });
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = parent.join(&stem);
+    if candidate == input {
+        parent.join(format!("{}.out", stem))
+    } else {
+        candidate
+    }
 }
 
 struct ResolvedCluster {
@@ -565,6 +634,7 @@ fn main() -> Result<()> {
             output,
             cluster,
             exclude,
+            preset,
             codec,
             level,
             block_size,
@@ -581,8 +651,9 @@ fn main() -> Result<()> {
             no_raw_bypass,
             streams,
         } => {
-            let codec_id = CodecId::from_name(&codec)?;
-            let level = codec_id.clamp_level(level.unwrap_or_else(|| codec_id.default_level()));
+            let (preset_id, codec_id, eff_level, auto_codec) =
+                resolve_preset_codec(&preset, codec.as_deref(), level)?;
+            let out_path = output.unwrap_or_else(|| default_pack_output(&source));
             let blk = if block_size.eq_ignore_ascii_case("auto") {
                 None
             } else {
@@ -614,10 +685,12 @@ fn main() -> Result<()> {
 
             run_pack(PackParams {
                 source_dir: &source,
-                output_path: &output,
+                output_path: &out_path,
                 excludes: &exclude,
                 codec: codec_id,
-                level,
+                level: eff_level,
+                preset: preset_id,
+                auto_codec,
                 block_size: blk,
                 mem_limit_bytes: rc.mem_bytes,
                 security: rc.security,
@@ -648,6 +721,7 @@ fn main() -> Result<()> {
             no_hedge,
             streams,
         } => {
+            let out_path = output.unwrap_or_else(|| default_extract_output(&input, true));
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
@@ -669,7 +743,7 @@ fn main() -> Result<()> {
             }
             run_unpack(DecompressParams {
                 input_path: &input,
-                output_path: &output,
+                output_path: &out_path,
                 mem_limit_bytes: rc.mem_bytes,
                 security: rc.security,
                 schedule: sched,
@@ -687,6 +761,7 @@ fn main() -> Result<()> {
             input,
             output,
             cluster,
+            preset,
             codec,
             level,
             format,
@@ -704,19 +779,19 @@ fn main() -> Result<()> {
             no_raw_bypass,
             streams,
         } => {
-            let codec_id = CodecId::from_name(&codec)?;
-            let level = codec_id.clamp_level(level.unwrap_or_else(|| codec_id.default_level()));
+            let (preset_id, codec_id, eff_level, auto_codec) =
+                resolve_preset_codec(&preset, codec.as_deref(), level)?;
             let container_fmt = match format.to_ascii_lowercase().as_str() {
                 "auto" => {
-                    if codec_id == CodecId::Zstd {
+                    if !auto_codec && codec_id == CodecId::Zstd {
                         ContainerFormat::ZstdSeekable
                     } else {
                         ContainerFormat::Sqz
                     }
                 }
                 "zst" | "zstd" => {
-                    if codec_id != CodecId::Zstd {
-                        bail!("--format zst requires --codec zstd");
+                    if auto_codec || codec_id != CodecId::Zstd {
+                        bail!("--format zst requires --codec zstd (use --format sqz for multi-codec/bzip3/ppmd/lzma2)");
                     }
                     ContainerFormat::ZstdSeekable
                 }
@@ -766,7 +841,9 @@ fn main() -> Result<()> {
                 input_path: &input,
                 output_path: &out_path,
                 codec: codec_id,
-                level,
+                level: eff_level,
+                preset: preset_id,
+                auto_codec,
                 format: container_fmt,
                 block_size: blk,
                 mem_limit_bytes: rc.mem_bytes,
@@ -799,6 +876,7 @@ fn main() -> Result<()> {
             no_verify,
             streams,
         } => {
+            let out_path = output.unwrap_or_else(|| default_extract_output(&input, false));
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
@@ -823,7 +901,7 @@ fn main() -> Result<()> {
 
             run_decompress(DecompressParams {
                 input_path: &input,
-                output_path: &output,
+                output_path: &out_path,
                 mem_limit_bytes: rc.mem_bytes,
                 security: rc.security,
                 schedule: sched,
@@ -841,6 +919,7 @@ fn main() -> Result<()> {
             input,
             workdir,
             cluster,
+            preset,
             codec,
             level,
             block_size,
@@ -852,8 +931,8 @@ fn main() -> Result<()> {
             streams,
             mem_limit,
         } => {
-            let codec_id = CodecId::from_name(&codec)?;
-            let level = codec_id.clamp_level(level.unwrap_or_else(|| codec_id.default_level()));
+            let (preset_id, codec_id, eff_level, auto_codec) =
+                resolve_preset_codec(&preset, codec.as_deref(), level)?;
             let blk = if block_size.eq_ignore_ascii_case("auto") {
                 None
             } else {
@@ -882,7 +961,7 @@ fn main() -> Result<()> {
             let orig_hash = hex_encode(&hash_file_blake3(&input).context("hashing input")?);
             println!("Input BLAKE3: {}\n", orig_hash);
 
-            let fmt = if codec_id == CodecId::Zstd {
+            let fmt = if !auto_codec && codec_id == CodecId::Zstd {
                 ContainerFormat::ZstdSeekable
             } else {
                 ContainerFormat::Sqz
@@ -892,12 +971,14 @@ fn main() -> Result<()> {
             let cluster_arc = dir.join(format!("bench_cluster.{}", ext));
             let restored = dir.join("bench_restored.bin");
 
-            println!(">>> [1/4] Baseline LOCAL-ONLY Compress ({} L{}) ...", codec_id.name(), level);
+            println!(">>> [1/4] Baseline LOCAL-ONLY Compress ({} L{}) ...", codec_id.name(), eff_level);
             let local_c = run_compress(CompressParams {
                 input_path: &input,
                 output_path: &local_arc,
                 codec: codec_id,
-                level,
+                level: eff_level,
+                preset: preset_id,
+                auto_codec,
                 format: fmt,
                 block_size: blk,
                 mem_limit_bytes: rc.mem_bytes,
@@ -912,12 +993,14 @@ fn main() -> Result<()> {
                 quiet: false,
             })?;
 
-            println!(">>> [2/4] CLUSTER Compress ({} L{}, sec={:?}, wire={:?}) ...", codec_id.name(), level, rc.security, rc.wire_codec);
+            println!(">>> [2/4] CLUSTER Compress ({} L{}, sec={:?}, wire={:?}) ...", codec_id.name(), eff_level, rc.security, rc.wire_codec);
             let cluster_c = run_compress(CompressParams {
                 input_path: &input,
                 output_path: &cluster_arc,
                 codec: codec_id,
-                level,
+                level: eff_level,
+                preset: preset_id,
+                auto_codec,
                 format: fmt,
                 block_size: blk,
                 mem_limit_bytes: rc.mem_bytes,
@@ -973,11 +1056,11 @@ fn main() -> Result<()> {
 
             println!("\n================= HEAD-TO-HEAD BENCHMARK =================");
             println!(
-                "  Codec / Level     : {} L{} | Security: {:?} | Wire: {:?} | BLAKE3: VERIFIED EXACT MATCH",
+                "  Codec / Level     : {} L{} (auto={}) | Security: {:?} | BLAKE3: VERIFIED EXACT MATCH",
                 codec_id.name(),
-                level,
-                rc.security,
-                rc.wire_codec
+                eff_level,
+                auto_codec,
+                rc.security
             );
             println!(
                 "  Compress Local    : {:7.3} s ({:7.2} MiB/s)",

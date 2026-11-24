@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use std::cell::RefCell;
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -9,6 +9,9 @@ pub enum CodecId {
     Zstd = 1,
     Lzma2 = 2,
     Lz4 = 3,
+    Lzma2Bcj = 4,
+    Bzip3 = 5,
+    Ppmd = 6,
 }
 
 impl CodecId {
@@ -18,6 +21,9 @@ impl CodecId {
             1 => Ok(Self::Zstd),
             2 => Ok(Self::Lzma2),
             3 => Ok(Self::Lz4),
+            4 => Ok(Self::Lzma2Bcj),
+            5 => Ok(Self::Bzip3),
+            6 => Ok(Self::Ppmd),
             _ => bail!("unknown codec id: {}", v),
         }
     }
@@ -26,9 +32,15 @@ impl CodecId {
         match s.to_ascii_lowercase().as_str() {
             "zstd" | "zst" => Ok(Self::Zstd),
             "lzma2" | "xz" | "lzma" => Ok(Self::Lzma2),
+            "lzma2-bcj" | "xz-bcj" | "bcj" => Ok(Self::Lzma2Bcj),
+            "bzip3" | "bz3" => Ok(Self::Bzip3),
+            "ppmd" | "ppmd7" => Ok(Self::Ppmd),
             "lz4" => Ok(Self::Lz4),
             "raw" | "store" => Ok(Self::Raw),
-            _ => bail!("unsupported codec '{}': use zstd, lzma2, or lz4", s),
+            _ => bail!(
+                "unsupported codec '{}': use auto, zstd, bzip3, ppmd, lzma2, lzma2-bcj, or lz4",
+                s
+            ),
         }
     }
 
@@ -38,6 +50,9 @@ impl CodecId {
             Self::Zstd => "zstd",
             Self::Lzma2 => "lzma2",
             Self::Lz4 => "lz4",
+            Self::Lzma2Bcj => "lzma2-bcj",
+            Self::Bzip3 => "bzip3",
+            Self::Ppmd => "ppmd",
         }
     }
 
@@ -46,6 +61,9 @@ impl CodecId {
             Self::Raw => 0,
             Self::Zstd => 9,
             Self::Lzma2 => 6,
+            Self::Lzma2Bcj => 6,
+            Self::Bzip3 => 8,  // block size in MiB (1..=32)
+            Self::Ppmd => 8,   // model order (4..=12)
             Self::Lz4 => 1,
         }
     }
@@ -54,9 +72,120 @@ impl CodecId {
         match self {
             Self::Raw => 0,
             Self::Zstd => level.clamp(1, 22),
-            Self::Lzma2 => level.clamp(0, 9),
+            Self::Lzma2 | Self::Lzma2Bcj => level.clamp(0, 9),
+            Self::Bzip3 => level.clamp(1, 32),
+            Self::Ppmd => level.clamp(4, 12),
             Self::Lz4 => level.clamp(1, 12),
         }
+    }
+}
+
+/// High-level human-friendly compression presets so users don't need to know algorithm internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    /// Maximum speed (LZ4 / Zstd L3)
+    Fast,
+    /// Everyday speed and ratio (Zstd L9 + LDM)
+    Balanced,
+    /// High compression with fast throughput (per-slab auto: bzip3 on text/CSV, lzma2-bcj on binaries, lzma2 L6 on mixed)
+    Small,
+    /// Smallest possible archive (per-slab auto: bzip3 on text/code, lzma2-bcj L9 on binaries, lzma2 L9 on mixed, 16M blocks)
+    Max,
+}
+
+impl Preset {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fast" | "speed" | "quick" => Ok(Self::Fast),
+            "balanced" | "default" | "normal" | "auto" => Ok(Self::Balanced),
+            "small" | "compact" | "high" | "smart" => Ok(Self::Small),
+            "max" | "ultra" | "best" | "extreme" => Ok(Self::Max),
+            _ => bail!("invalid preset '{}': use fast, balanced, small, or max", s),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Small => "small",
+            Self::Max => "max",
+        }
+    }
+
+    /// Default primary codec and level for this preset (when `--codec` is not manually forced).
+    pub fn default_codec_and_level(self) -> (CodecId, i32, bool) {
+        // Returns (fallback_codec, level, enable_per_slab_auto)
+        match self {
+            Self::Fast => (CodecId::Zstd, 3, false),
+            Self::Balanced => (CodecId::Zstd, 9, false),
+            Self::Small => (CodecId::Lzma2, 6, true),
+            Self::Max => (CodecId::Lzma2, 9, true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlabKind {
+    Text,
+    Executable,
+    Binary,
+}
+
+/// Fast (<0.05 ms) general-purpose content classifier for per-slab codec selection.
+/// Inspects up to 8 KiB across the slab to distinguish text/source/CSV, x86 executables, and general binary.
+pub fn classify_slab_content(data: &[u8]) -> SlabKind {
+    if data.is_empty() {
+        return SlabKind::Binary;
+    }
+    // Check ELF or Windows PE executable header
+    if data.len() >= 4 && (&data[0..4] == b"\x7fELF" || (&data[0..2] == b"MZ" && data.len() > 64)) {
+        return SlabKind::Executable;
+    }
+
+    let sample = &data[..data.len().min(8192)];
+    let mut printable = 0usize;
+    let mut x86_opcodes = 0usize;
+    for &b in sample {
+        if (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+            printable += 1;
+        }
+        // x86/x86-64 relative CALL (0xE8) and JMP (0xE9) instructions
+        if b == 0xE8 || b == 0xE9 {
+            x86_opcodes += 1;
+        }
+    }
+
+    if printable * 100 >= sample.len() * 88 {
+        return SlabKind::Text;
+    }
+    // Heuristic: dense x86 machine code inside solid binary slabs benefits strongly from BCJ
+    if x86_opcodes * 1000 >= sample.len() * 14 && printable * 100 < sample.len() * 55 {
+        return SlabKind::Executable;
+    }
+    SlabKind::Binary
+}
+
+/// Choose the optimal `(CodecId, level)` for a single slab when per-slab auto-codec is active.
+pub fn pick_auto_slab_codec(data: &[u8], preset: Preset, fallback_level: i32) -> (CodecId, i32) {
+    let kind = classify_slab_content(data);
+    match preset {
+        Preset::Fast => (CodecId::Zstd, 3),
+        Preset::Balanced => match kind {
+            SlabKind::Text => (CodecId::Bzip3, 8),
+            SlabKind::Executable => (CodecId::Zstd, 9),
+            SlabKind::Binary => (CodecId::Zstd, 9),
+        },
+        Preset::Small => match kind {
+            SlabKind::Text => (CodecId::Bzip3, 8),
+            SlabKind::Executable => (CodecId::Lzma2Bcj, 6),
+            SlabKind::Binary => (CodecId::Lzma2, fallback_level.clamp(4, 6)),
+        },
+        Preset::Max => match kind {
+            SlabKind::Text => (CodecId::Bzip3, 16),
+            SlabKind::Executable => (CodecId::Lzma2Bcj, 9),
+            SlabKind::Binary => (CodecId::Lzma2, 9),
+        },
     }
 }
 
@@ -68,8 +197,6 @@ thread_local! {
 }
 
 /// Ultra-fast (<0.05 ms) entropy/pre-compressed slab detector.
-/// Samples 4 x 16 KiB slices spread across the slab using LZ4; if savings < 1.5%,
-/// the slab is already compressed/encrypted (e.g. .7z, .mp4, .jpg, .ipsw) and should be stored raw!
 pub fn is_likely_incompressible(data: &[u8]) -> bool {
     if data.len() < 65_536 {
         return false;
@@ -85,12 +212,10 @@ pub fn is_likely_incompressible(data: &[u8]) -> bool {
         total_in += sample_len;
         total_out += comp.len();
     }
-    // If LZ4 achieves < 1.5% reduction across all 4 distributed samples, skip heavy CPU compression!
     total_out * 1000 >= total_in * 985
 }
 
-/// Ultra-fast Wi-Fi wire-pre-shrink using reusable thread-local Zstd Level 1 (~500-800 MiB/s/core).
-/// Shrinks mixed/PE/code slabs 25-35% smaller than LZ4 in <3 ms!
+/// Ultra-fast wire pre-shrink using reusable thread-local Zstd Level 1.
 pub fn wire_shrink_zstd1(input: &[u8]) -> Result<Vec<u8>> {
     ZSTD_WIRE_CCTX.with(|cell| {
         let mut cctx = cell.borrow_mut();
@@ -113,7 +238,6 @@ pub fn wire_shrink_zstd1(input: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-/// Expand a `wire_shrink_zstd1` payload in <1 ms on the receiver.
 pub fn wire_expand_zstd1(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     ZSTD_WIRE_DCTX.with(|cell| {
         let mut dctx = cell.borrow_mut();
@@ -126,8 +250,7 @@ pub fn wire_expand_zstd1(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     })
 }
 
-/// Compress a single independent block using C/ASM SIMD kernels.
-/// Enables Zstd Long-Distance Matching (LDM) + 32 MiB match window for higher compression at lower CPU cost!
+/// Compress a single independent slab with any of the 6 supported codecs.
 pub fn compress_block(codec: CodecId, level: i32, input: &[u8]) -> Result<Vec<u8>> {
     let level = codec.clamp_level(level);
     match codec {
@@ -142,7 +265,6 @@ pub fn compress_block(codec: CodecId, level: i32, input: &[u8]) -> Result<Vec<u8
                 .map_err(|e| anyhow::anyhow!("zstd checksum flag failed: {}", zstd_safe::get_error_name(e)))?;
             cctx.set_parameter(zstd_safe::CParameter::ContentSizeFlag(true))
                 .map_err(|e| anyhow::anyhow!("zstd content size flag failed: {}", zstd_safe::get_error_name(e)))?;
-            // Long-Distance Matching (LDM): finds long-range cross-file patterns with minimal CPU cost!
             if input.len() >= 1024 * 1024 {
                 let _ = cctx.set_parameter(zstd_safe::CParameter::EnableLongDistanceMatching(true));
                 let _ = cctx.set_parameter(zstd_safe::CParameter::WindowLog(25));
@@ -162,11 +284,52 @@ pub fn compress_block(codec: CodecId, level: i32, input: &[u8]) -> Result<Vec<u8
             encoder.read_to_end(&mut out)?;
             Ok(out)
         }
+        CodecId::Lzma2Bcj => {
+            let mut filters = xz2::stream::Filters::new();
+            filters.x86();
+            let opts = xz2::stream::LzmaOptions::new_preset(level as u32)
+                .map_err(|e| anyhow::anyhow!("lzma2-bcj preset failed: {}", e))?;
+            filters.lzma2(&opts);
+            let stream = xz2::stream::Stream::new_stream_encoder(&filters, xz2::stream::Check::Crc64)
+                .map_err(|e| anyhow::anyhow!("lzma2-bcj encoder init failed: {}", e))?;
+            let mut encoder = xz2::bufread::XzEncoder::new_stream(input, stream);
+            let mut out = Vec::with_capacity(input.len() / 2 + 1024);
+            encoder.read_to_end(&mut out)?;
+            Ok(out)
+        }
+        CodecId::Bzip3 => {
+            let bs_mib = (level as u32).clamp(1, 32);
+            // Match block size cleanly to slab length to avoid wasting RAM on small tail slabs
+            let slab_mib = ((input.len() + 1_048_575) / 1_048_576).max(1) as u32;
+            let eff_mib = bs_mib.min(slab_mib).max(1);
+            let block_size = bzip3::BlockSize::mib(eff_mib)
+                .unwrap_or_else(|| bzip3::BlockSize::mib(8).unwrap());
+            let mut encoder = bzip3::read::Bz3Encoder::new(input, block_size)
+                .map_err(|e| anyhow::anyhow!("bzip3 encoder init failed: {}", e))?;
+            let mut out = Vec::with_capacity(input.len() / 2 + 1024);
+            encoder.read_to_end(&mut out)?;
+            Ok(out)
+        }
+        CodecId::Ppmd => {
+            let order = (level as u32).clamp(4, 12);
+            let mem_size: u32 = 32 * 1024 * 1024;
+            let mut out = Vec::with_capacity(input.len() / 2 + 1024);
+            // Prepend 5-byte PPMd7 header: [order:1][mem_size:4 LE]
+            out.push(order as u8);
+            out.extend_from_slice(&mem_size.to_le_bytes());
+            {
+                let mut enc = ppmd_rust::Ppmd7Encoder::new(&mut out, order, mem_size)
+                    .map_err(|e| anyhow::anyhow!("ppmd7 encoder init failed: {}", e))?;
+                enc.write_all(input)?;
+                enc.finish(true)?;
+            }
+            Ok(out)
+        }
         CodecId::Lz4 => Ok(lz4_flex::block::compress_prepend_size(input)),
     }
 }
 
-/// Decompress a single independent block into an exact-sized output buffer.
+/// Decompress a single independent slab into an exact-sized output buffer.
 pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) -> Result<Vec<u8>> {
     match codec {
         CodecId::Raw => {
@@ -195,7 +358,8 @@ pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) 
             }
             Ok(out)
         }),
-        CodecId::Lzma2 => {
+        CodecId::Lzma2 | CodecId::Lzma2Bcj => {
+            // Standard XZ stream header self-describes BCJ + LZMA2 filter chain!
             let mut decoder = xz2::bufread::XzDecoder::new(input);
             let mut out = Vec::with_capacity(expected_orig_len);
             decoder.read_to_end(&mut out)?;
@@ -206,6 +370,32 @@ pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) 
                     expected_orig_len
                 );
             }
+            Ok(out)
+        }
+        CodecId::Bzip3 => {
+            let mut decoder = bzip3::read::Bz3Decoder::new(input)
+                .map_err(|e| anyhow::anyhow!("bzip3 decoder init failed: {}", e))?;
+            let mut out = Vec::with_capacity(expected_orig_len);
+            decoder.read_to_end(&mut out)?;
+            if out.len() != expected_orig_len {
+                bail!(
+                    "bzip3 decompressed size mismatch: got {}, expected {}",
+                    out.len(),
+                    expected_orig_len
+                );
+            }
+            Ok(out)
+        }
+        CodecId::Ppmd => {
+            if input.len() < 5 {
+                bail!("truncated ppmd7 block");
+            }
+            let order = input[0] as u32;
+            let mem_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
+            let mut dec = ppmd_rust::Ppmd7Decoder::new(&input[5..], order, mem_size)
+                .map_err(|e| anyhow::anyhow!("ppmd7 decoder init failed: {}", e))?;
+            let mut out = vec![0u8; expected_orig_len];
+            dec.read_exact(&mut out)?;
             Ok(out)
         }
         CodecId::Lz4 => {

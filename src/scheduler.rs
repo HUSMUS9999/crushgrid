@@ -1,7 +1,7 @@
 use crate::archiver::{MultiFileStreamReader, MultiFileUnpacker, build_pack_plan};
 use crate::codec::{
-    CodecId, compress_block, decompress_block, is_likely_incompressible, wire_expand_zstd1,
-    wire_shrink_zstd1,
+    CodecId, Preset, compress_block, decompress_block, is_likely_incompressible,
+    pick_auto_slab_codec, wire_expand_zstd1, wire_shrink_zstd1,
 };
 use crate::container::{
     CHUNK_FLAG_COMPRESSED, CHUNK_FLAG_DEDUP_REF, CHUNK_FLAG_RAW_STORED, ChunkIndexEntry,
@@ -261,6 +261,8 @@ struct WorkTask {
     orig_len: usize,
     expected_xxh3: u64,
     chunk_flags: u8,
+    codec: CodecId,
+    level: i32,
     input: Arc<Vec<u8>>,
     _budget: Arc<BudgetGuard>,
 }
@@ -277,6 +279,7 @@ struct CompletedChunk {
     orig_len: usize,
     orig_xxh3: u64,
     chunk_flags: u8,
+    slab_codec: CodecId,
     dedup_ref_chunk_id: Option<u64>,
     output: Vec<u8>,
     node_idx: usize,
@@ -422,13 +425,15 @@ pub fn choose_block_size(
 
     let (min_b, max_b) = match codec {
         CodecId::Raw => (4 * 1024 * 1024, 16 * 1024 * 1024),
-        CodecId::Lzma2 => {
-            if level >= 6 {
-                (1024 * 1024, 4 * 1024 * 1024)
+        CodecId::Lzma2 | CodecId::Lzma2Bcj => {
+            if level >= 9 {
+                (2 * 1024 * 1024, 16 * 1024 * 1024)
             } else {
-                (1024 * 1024, 4 * 1024 * 1024)
+                (1024 * 1024, 8 * 1024 * 1024)
             }
         }
+        CodecId::Bzip3 => (2 * 1024 * 1024, 16 * 1024 * 1024),
+        CodecId::Ppmd => (2 * 1024 * 1024, 8 * 1024 * 1024),
         CodecId::Zstd => {
             if level >= 15 {
                 (2 * 1024 * 1024, 8 * 1024 * 1024)
@@ -449,6 +454,8 @@ pub struct CompressParams<'a> {
     pub output_path: &'a Path,
     pub codec: CodecId,
     pub level: i32,
+    pub preset: Preset,
+    pub auto_codec: bool,
     pub format: ContainerFormat,
     pub block_size: Option<usize>,
     pub mem_limit_bytes: usize,
@@ -510,6 +517,8 @@ pub struct PackParams<'a> {
     pub excludes: &'a [String],
     pub codec: CodecId,
     pub level: i32,
+    pub preset: Preset,
+    pub auto_codec: bool,
     pub block_size: Option<usize>,
     pub mem_limit_bytes: usize,
     pub security: SecurityMode,
@@ -564,6 +573,8 @@ pub fn run_pack(params: PackParams<'_>) -> Result<JobSummary> {
         output_path: params.output_path,
         codec: params.codec,
         level: params.level,
+        preset: params.preset,
+        auto_codec: params.auto_codec,
         format: ContainerFormat::Sqz,
         block_size: params.block_size,
         mem_limit_bytes: params.mem_limit_bytes,
@@ -616,21 +627,26 @@ fn run_compress_stream(
     );
     let total_chunks = (total_orig_size + block_size as u64 - 1) / block_size as u64;
 
-    // Dedup & zero-CPU raw slab bypass require .sqz v2 container (keep .zst 100% pure Zstd frames!)
+    // Dedup, zero-CPU raw slab bypass, and per-slab auto-codec require .sqz v3 container
     let allow_sqz_smart = params.format == ContainerFormat::Sqz;
     let use_dedup = allow_sqz_smart && params.dedup;
     let use_entropy_bypass = allow_sqz_smart && params.entropy_bypass;
+    let use_auto_codec = allow_sqz_smart && params.auto_codec;
 
     if !params.quiet {
-        let ldm_tag = if params.codec == CodecId::Zstd { " (LDM)" } else { "" };
+        let codec_label = if use_auto_codec {
+            format!("auto (preset={})", params.preset.name())
+        } else if params.codec == CodecId::Zstd {
+            format!("zstd L{} (LDM)", params.level)
+        } else {
+            format!("{} L{}", params.codec.name(), params.level)
+        };
         println!(
-            "[squiz-archive] Compress {} ({:.2} MiB) -> {} | codec={} L{}{} | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
+            "[squiz-archive] Compress {} ({:.2} MiB) -> {} | codec={} | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
             source_label,
             total_orig_size as f64 / 1048576.0,
             params.output_path.display(),
-            params.codec.name(),
-            params.level,
-            ldm_tag,
+            codec_label,
             params.format,
             block_size as f64 / 1048576.0,
             total_chunks,
@@ -709,8 +725,6 @@ fn run_compress_stream(
             worker_handles.push(spawn_local_workers(
                 node_idx,
                 eff_threads,
-                params.codec,
-                params.level,
                 false,
                 params.hedge,
                 work_rx.clone(),
@@ -735,8 +749,6 @@ fn run_compress_stream(
                 total_chunks,
                 local_threads > 0,
                 airtime_weight,
-                params.codec,
-                params.level,
                 false,
                 resolved_wire,
                 params.security,
@@ -829,8 +841,6 @@ fn run_compress_stream(
             pending.insert(chunk.chunk_id, chunk);
             while let Some(ready) = pending.remove(&next_id) {
                 if let Some(ref_id) = ready.dedup_ref_chunk_id {
-                    // Exact BLAKE3 slab duplicate -> 0 bytes written to disk!
-                    // Point directly at the earlier stored frame's (comp_offset, comp_len, flags)!
                     let target = &entries[ref_id as usize];
                     entries.push(ChunkIndexEntry {
                         chunk_id: ready.chunk_id,
@@ -840,6 +850,7 @@ fn run_compress_stream(
                         orig_len: ready.orig_len as u32,
                         xxh3_64: ready.orig_xxh3,
                         chunk_flags: target.chunk_flags | CHUNK_FLAG_DEDUP_REF,
+                        slab_codec: target.slab_codec,
                     });
                 } else {
                     writer.write_all(&ready.output)?;
@@ -852,6 +863,7 @@ fn run_compress_stream(
                         orig_len: ready.orig_len as u32,
                         xxh3_64: ready.orig_xxh3,
                         chunk_flags: ready.chunk_flags,
+                        slab_codec: ready.slab_codec,
                     });
                     comp_cursor += comp_len as u64;
                 }
@@ -944,6 +956,7 @@ fn run_compress_stream(
                     orig_len: actual_len,
                     orig_xxh3: xxh,
                     chunk_flags: CHUNK_FLAG_DEDUP_REF,
+                    slab_codec: CodecId::Raw,
                     dedup_ref_chunk_id: Some(prev_chunk_id),
                     output: Vec::new(),
                     node_idx: local_node_idx,
@@ -957,7 +970,7 @@ fn run_compress_stream(
             dedup_index.insert(slab_digest, chunk_id);
         }
 
-        // 2. Zero-CPU Incompressible Slab Bypass (<0.05 ms entropy probe -> skip heavy codec on .7z/.mp4/.jpg!)
+        // 2. Zero-CPU Incompressible Slab Bypass (<0.05 ms entropy probe)
         if use_entropy_bypass && is_likely_incompressible(&buf) {
             raw_bypass_bytes.fetch_add(actual_len as u64, Ordering::Relaxed);
             drop(guard);
@@ -967,6 +980,7 @@ fn run_compress_stream(
                 orig_len: actual_len,
                 orig_xxh3: xxh,
                 chunk_flags: CHUNK_FLAG_RAW_STORED,
+                slab_codec: CodecId::Raw,
                 dedup_ref_chunk_id: None,
                 output: buf,
                 node_idx: local_node_idx,
@@ -978,12 +992,21 @@ fn run_compress_stream(
             continue;
         }
 
+        // 3. Per-Slab Auto-Codec Selection (bzip3 for text/CSV, lzma2-bcj for binaries, lzma2/zstd for mixed)
+        let (slab_codec, slab_level) = if use_auto_codec {
+            pick_auto_slab_codec(&buf, params.preset, params.level)
+        } else {
+            (params.codec, params.level)
+        };
+
         let task = Arc::new(WorkTask {
             chunk_id,
             orig_offset: offset,
             orig_len: actual_len,
             expected_xxh3: xxh,
             chunk_flags: CHUNK_FLAG_COMPRESSED,
+            codec: slab_codec,
+            level: slab_level,
             input: Arc::new(buf),
             _budget: guard,
         });
@@ -1176,8 +1199,6 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
             worker_handles.push(spawn_local_workers(
                 node_idx,
                 eff_threads,
-                manifest.codec,
-                0,
                 true,
                 params.hedge,
                 work_rx.clone(),
@@ -1199,8 +1220,6 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
                 total_chunks,
                 local_threads > 0,
                 1.0,
-                manifest.codec,
-                0,
                 true,
                 resolved_wire,
                 params.security,
@@ -1285,8 +1304,7 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
         let mut comp_buf = vec![0u8; entry.comp_len as usize];
         read_exact_at(&in_file, &mut comp_buf, entry.comp_offset)?;
 
-        if is_raw_stored {
-            // Stored raw slab: write straight to sink with zero decompression CPU!
+        if is_raw_stored || entry.slab_codec == CodecId::Raw {
             drop(guard);
             res_tx.send(CompletedChunk {
                 chunk_id: entry.chunk_id,
@@ -1294,6 +1312,7 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
                 orig_len: entry.orig_len as usize,
                 orig_xxh3: entry.xxh3_64,
                 chunk_flags: entry.chunk_flags,
+                slab_codec: CodecId::Raw,
                 dedup_ref_chunk_id: None,
                 output: comp_buf,
                 node_idx: local_node_idx,
@@ -1309,6 +1328,8 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
             orig_len: entry.orig_len as usize,
             expected_xxh3: entry.xxh3_64,
             chunk_flags: entry.chunk_flags,
+            codec: entry.slab_codec,
+            level: 0,
             input: Arc::new(comp_buf),
             _budget: guard,
         });
@@ -1395,8 +1416,21 @@ pub fn run_inspect(path: &Path, list_files: bool) -> Result<()> {
         .map(|e| e.orig_len as u64)
         .sum();
 
+    let mut codec_counts: BTreeMap<&'static str, (usize, u64)> = BTreeMap::new();
+    for e in &m.entries {
+        if (e.chunk_flags & CHUNK_FLAG_DEDUP_REF) == 0 {
+            let entry = codec_counts.entry(e.slab_codec.name()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += e.orig_len as u64;
+        }
+    }
+    let codec_summary: Vec<String> = codec_counts
+        .iter()
+        .map(|(k, (cnt, bytes))| format!("{}:{} ({:.1} MiB)", k, cnt, *bytes as f64 / 1048576.0))
+        .collect();
+
     println!("\n=== squiz-archive Inspect: {} ===", path.display());
-    println!("  Format          : {:?} | Codec: {}", m.format, m.codec.name());
+    println!("  Format          : {:?} | Primary Codec: {} | Slabs: [{}]", m.format, m.codec.name(), codec_summary.join(", "));
     println!(
         "  Original Size   : {:.2} MiB ({:.2} GiB)",
         m.total_orig_size as f64 / 1048576.0,
@@ -1498,7 +1532,9 @@ fn select_active_nodes(
                     CodecId::Raw => 2000.0,
                     CodecId::Zstd => 220.0,
                     CodecId::Lz4 => 650.0,
-                    CodecId::Lzma2 => 65.0,
+                    CodecId::Lzma2 | CodecId::Lzma2Bcj => 65.0,
+                    CodecId::Bzip3 => 25.0,
+                    CodecId::Ppmd => 20.0,
                 };
                 let local_est_mbps = local_threads as f64 * per_thread_mbps;
                 let mut filtered = Vec::new();
@@ -1527,8 +1563,6 @@ fn select_active_nodes(
 fn spawn_local_workers(
     node_idx: usize,
     threads: usize,
-    codec: CodecId,
-    level: i32,
     is_decompress: bool,
     hedge: bool,
     work_rx: crossbeam_channel::Receiver<Arc<WorkTask>>,
@@ -1605,9 +1639,9 @@ fn spawn_local_workers(
 
                     let t0 = Instant::now();
                     let out = if is_decompress {
-                        decompress_block(codec, &task.input, task.orig_len)
+                        decompress_block(task.codec, &task.input, task.orig_len)
                     } else {
-                        compress_block(codec, level, &task.input)
+                        compress_block(task.codec, task.level, &task.input)
                     };
                     pace_c.record(t0.elapsed().as_micros() as u64);
 
@@ -1619,6 +1653,7 @@ fn spawn_local_workers(
                                 orig_len: task.orig_len,
                                 orig_xxh3: task.expected_xxh3,
                                 chunk_flags: task.chunk_flags,
+                                slab_codec: task.codec,
                                 dedup_ref_chunk_id: None,
                                 output,
                                 node_idx,
@@ -1650,8 +1685,6 @@ fn spawn_remote_worker_node(
     total_chunks: u64,
     has_local: bool,
     airtime_weight: f64,
-    codec: CodecId,
-    level: i32,
     is_decompress: bool,
     wire_codec: WireCodec,
     security: SecurityMode,
@@ -1841,6 +1874,7 @@ fn spawn_remote_worker_node(
                                                     orig_len: task.orig_len,
                                                     orig_xxh3: task.expected_xxh3,
                                                     chunk_flags: task.chunk_flags,
+                                                    slab_codec: task.codec,
                                                     dedup_ref_chunk_id: None,
                                                     output,
                                                     node_idx,
@@ -1999,8 +2033,8 @@ fn spawn_remote_worker_node(
 
                         let hdr = FrameHeader {
                             msg_type: MsgType::JobReq,
-                            codec: codec as u8,
-                            level: level as i8,
+                            codec: task.codec as u8,
+                            level: task.level as i8,
                             flags,
                             chunk_id: task.chunk_id,
                             orig_len: task.orig_len as u32,

@@ -41,6 +41,8 @@ pub struct ChunkIndexEntry {
     pub orig_len: u32,
     pub xxh3_64: u64,
     pub chunk_flags: u8,
+    /// Per-slab codec (v3 `.sqz` multi-codec support; 0xFF = use archive header default codec)
+    pub slab_codec: CodecId,
 }
 
 /// File metadata inside a multi-file / whole-directory `.sqz` archive.
@@ -161,17 +163,18 @@ pub fn finalize_sqz(
         table_buf.extend_from_slice(&e.orig_len.to_le_bytes());
         table_buf.extend_from_slice(&e.xxh3_64.to_le_bytes());
         table_buf.push(e.chunk_flags);
-        table_buf.extend_from_slice(&[0u8; 3]); // 4-byte aligned padding
+        table_buf.push(e.slab_codec as u8); // v3 per-slab codec (zero extra bytes!)
+        table_buf.extend_from_slice(&[0u8; 2]);
     }
     table_buf.extend_from_slice(&table_offset.to_le_bytes());
     table_buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     table_buf.extend_from_slice(&SQZ_FOOTER_MAGIC);
     file.write_all(&table_buf)?;
 
-    // Seek back to 0 and write 80-byte SQZ v2 header
+    // Seek back to 0 and write 80-byte SQZ v3 header (backwards-compatible layout with v2!)
     let mut hdr = [0u8; SQZ_HEADER_LEN];
     hdr[0..4].copy_from_slice(&SQZ_HEADER_MAGIC);
-    hdr[4] = 2; // version 2
+    hdr[4] = 3; // version 3 (per-slab multi-codec)
     hdr[5] = codec as u8;
     hdr[6] = level as i8 as u8;
     hdr[7] = if files.is_empty() { 0 } else { 1 };
@@ -246,8 +249,9 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
     let mut hdr = [0u8; SQZ_HEADER_LEN];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut hdr)?;
-    if hdr[4] != 2 {
-        bail!("unsupported .sqz version: {}", hdr[4]);
+    let version = hdr[4];
+    if version != 2 && version != 3 {
+        bail!("unsupported .sqz version: {}", version);
     }
     let codec = CodecId::from_u8(hdr[5])?;
     let total_orig_size = u64::from_le_bytes(hdr[12..20].try_into().unwrap());
@@ -279,6 +283,14 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
     let mut entries = Vec::with_capacity(num_chunks as usize);
     for i in 0..num_chunks as usize {
         let base = i * SQZ_ENTRY_LEN;
+        let flags = raw[base + 32];
+        let slab_codec = if version >= 3 {
+            CodecId::from_u8(raw[base + 33]).unwrap_or(codec)
+        } else if (flags & CHUNK_FLAG_RAW_STORED) != 0 {
+            CodecId::Raw
+        } else {
+            codec
+        };
         entries.push(ChunkIndexEntry {
             chunk_id: i as u64,
             comp_offset: u64::from_le_bytes(raw[base..base + 8].try_into().unwrap()),
@@ -286,7 +298,8 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
             orig_offset: u64::from_le_bytes(raw[base + 12..base + 20].try_into().unwrap()),
             orig_len: u32::from_le_bytes(raw[base + 20..base + 24].try_into().unwrap()),
             xxh3_64: u64::from_le_bytes(raw[base + 24..base + 32].try_into().unwrap()),
-            chunk_flags: raw[base + 32],
+            chunk_flags: flags,
+            slab_codec,
         });
     }
 
@@ -350,6 +363,7 @@ fn read_hsq_v1_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
             orig_len: u32::from_le_bytes(raw[base + 20..base + 24].try_into().unwrap()),
             xxh3_64: u64::from_le_bytes(raw[base + 24..base + 32].try_into().unwrap()),
             chunk_flags: CHUNK_FLAG_COMPRESSED,
+            slab_codec: codec,
         });
     }
 
@@ -409,6 +423,7 @@ fn read_zstd_seekable_manifest(file: &mut File, file_len: u64) -> Result<Archive
             orig_len,
             xxh3_64: 0,
             chunk_flags: CHUNK_FLAG_COMPRESSED,
+            slab_codec: CodecId::Zstd,
         });
         comp_off += comp_len as u64;
         orig_off += orig_len as u64;
