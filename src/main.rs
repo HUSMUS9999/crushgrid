@@ -2,6 +2,7 @@ mod archiver;
 mod codec;
 mod container;
 mod io_engine;
+mod nl;
 mod pool;
 mod protocol;
 mod resource;
@@ -14,8 +15,9 @@ use codec::{CodecId, Preset};
 use container::ContainerFormat;
 use protocol::{DEFAULT_MAX_FRAME_BYTES, SecurityMode, WireCodec};
 use resource::{
-    ClusterFileConfig, NodeSpec, interactive_pick, load_cluster_file, parse_size,
-    probe_local_system,
+    ClusterFileConfig, NodeSpec, auto_mem_limit_bytes, discover_default_cluster_config,
+    interactive_pick, load_cluster_file, parse_size, probe_local_system, run_doctor,
+    run_init_wizard,
 };
 use scheduler::{
     CompressParams, DecompressParams, PackParams, ScheduleMode, hash_file_blake3, hex_encode,
@@ -30,12 +32,17 @@ use worker::{WorkerConfig, run_worker};
     name = "squiz-archive",
     version,
     about = "Distributed multi-node compression and archival CLI for LAN, VPN, and cloud hosts",
-    long_about = "Distributed multi-node compression and archival CLI.\n\n\
-Presets (no codec knowledge required):\n  \
+    after_help = "Presets (-m / --preset):\n  \
   fast      Maximum speed (Zstd L3)\n  \
   balanced  Everyday speed and ratio (Zstd L9 + LDM, default)\n  \
   small     High ratio, fast multi-codec (Bzip3 on text/CSV, LZMA2+BCJ on binaries, LZMA2 L6 on mixed)\n  \
-  max       Smallest archive (Bzip3 16M on text/code, LZMA2+BCJ L9 on binaries, LZMA2 L9 on mixed)"
+  max       Smallest archive (Bzip3 16M on text/code, LZMA2+BCJ L9 on binaries, LZMA2 L9 on mixed)\n\n\
+Quick Examples:\n  \
+  squiz-archive init                                      # Generate cluster.conf + 256-bit token\n  \
+  squiz-archive doctor                                    # Inspect CPU, RAM, config, and TCP stack\n  \
+  squiz-archive pack ./data --preset small                # Zero-config archive (auto-detects cluster.conf)\n  \
+  squiz-archive unpack data.sqz                           # Extract in parallel\n  \
+  squiz-archive do \"compress ./logs as small as possible\" # Plain-English command mode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,6 +51,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Translate a plain-English request into a squiz-archive command and run it
+    #[command(name = "do", visible_alias = "ask")]
+    Do {
+        /// Plain-English request, e.g. "compress ./backups as small as possible using 50% cpu"
+        #[arg(required = true, num_args = 1..)]
+        request: Vec<String>,
+
+        /// Print the resolved CLI command without executing it
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Interactive cluster setup wizard (generates a CSPRNG token and cluster.conf)
+    Init {
+        /// Output config path (defaults to ~/.config/squiz-archive/cluster.conf)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Comma-separated remote worker addresses (non-interactive mode)
+        #[arg(long)]
+        nodes: Option<String>,
+
+        /// Default security mode: aead (default) or auth-only
+        #[arg(long, default_value = "aead")]
+        security: String,
+    },
+
+    /// Inspect local CPU, RAM, auto-detected cluster.conf, codecs, and OS TCP tuning
+    Doctor,
+
     /// Run a secure multi-stream compute worker daemon with hard CPU/RAM ceilings
     Worker {
         /// Listen address (e.g. 0.0.0.0:7878 or your Tailscale IP:7878)
@@ -69,7 +106,6 @@ enum Commands {
 
     /// Probe available nodes, CPU/RAM resources, RTT, and live link bandwidth
     Probe {
-        /// Path to an N-node cluster config file (see cluster.conf.example)
         #[arg(long)]
         cluster: Option<PathBuf>,
 
@@ -78,6 +114,10 @@ enum Commands {
 
         #[arg(long)]
         nodes: Option<String>,
+
+        /// Ignore any auto-detected cluster.conf and probe only the local host
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
@@ -96,9 +136,12 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        /// Ignore any auto-detected cluster.conf and run locally only
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         /// Exclude top-level folder/file names (repeatable)
         #[arg(long = "exclude")]
@@ -120,7 +163,7 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         block_size: String,
 
-        /// Coordinator hard RAM limit (e.g. 2G, 4G, 512M)
+        /// Coordinator hard RAM limit (defaults to 1/3 available RAM, clamped to 256M..4G)
         #[arg(long)]
         mem_limit: Option<String>,
 
@@ -168,13 +211,15 @@ enum Commands {
         /// Input `.sqz` archive path
         input: PathBuf,
 
-        /// Destination directory (defaults to archive stem in current directory)
+        /// Destination directory (defaults to archive stem)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         #[arg(long)]
         mem_limit: Option<String>,
@@ -222,9 +267,11 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         /// Human-friendly compression preset: fast, balanced (default), small, max
         #[arg(short = 'm', long, default_value = "balanced")]
@@ -289,9 +336,11 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         #[arg(long)]
         mem_limit: Option<String>,
@@ -335,9 +384,11 @@ enum Commands {
         #[arg(long)]
         workdir: Option<PathBuf>,
 
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
+
+        #[arg(long, default_value_t = false)]
+        local: bool,
 
         /// Compression preset: fast, balanced, small, max
         #[arg(short = 'm', long, default_value = "balanced")]
@@ -377,30 +428,24 @@ enum Commands {
 
     /// Measure raw multi-stream TCP + AEAD bidirectional wire throughput to remote workers
     NetBench {
-        /// Path to an N-node cluster config file
         #[arg(long)]
         cluster: Option<PathBuf>,
 
         #[arg(long = "node")]
         node: Vec<String>,
 
-        /// Comma-separated remote host:port targets
         #[arg(long)]
         nodes: Option<String>,
 
-        /// Shared auth token
         #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
         token: String,
 
-        /// Security mode: aead or auth-only
         #[arg(long)]
         security: Option<String>,
 
-        /// Parallel TCP streams per node
         #[arg(long)]
         streams: Option<usize>,
 
-        /// One-way MiB to transmit per node (bidirectional = 2x)
         #[arg(long, default_value_t = 32)]
         mib: usize,
     },
@@ -463,6 +508,7 @@ struct ResolvedCluster {
 #[allow(clippy::too_many_arguments)]
 fn resolve_cluster(
     cluster_path: Option<&PathBuf>,
+    force_local: bool,
     node_args: &[String],
     nodes_csv: Option<&str>,
     cli_token: &str,
@@ -472,8 +518,23 @@ fn resolve_cluster(
     cli_streams: Option<usize>,
     default_streams: usize,
 ) -> Result<ResolvedCluster> {
-    let file_cfg = match cluster_path {
-        Some(p) => load_cluster_file(p)?,
+    let explicit_nodes = !node_args.is_empty() || nodes_csv.is_some();
+    let effective_cluster_path = if force_local {
+        None
+    } else if let Some(p) = cluster_path {
+        Some(p.clone())
+    } else if !explicit_nodes {
+        let auto = discover_default_cluster_config();
+        if let Some(ref p) = auto {
+            println!("[squiz-archive] Auto-loaded cluster config: {}", p.display());
+        }
+        auto
+    } else {
+        None
+    };
+
+    let file_cfg = match effective_cluster_path {
+        Some(ref p) => load_cluster_file(p)?,
         None => ClusterFileConfig::default(),
     };
 
@@ -498,16 +559,19 @@ fn resolve_cluster(
         .unwrap_or_else(|| "auto".to_string());
     let wire_codec = WireCodec::from_str(&wire_str)?;
 
-    let mem_str = cli_mem_limit
-        .map(|s| s.to_string())
-        .or(file_cfg.mem_limit)
-        .unwrap_or_else(|| "2G".to_string());
-    let mem_bytes = parse_size(&mem_str)?;
+    let mem_bytes = match cli_mem_limit.map(|s| s.to_string()).or(file_cfg.mem_limit) {
+        Some(m) => parse_size(&m)?,
+        None => auto_mem_limit_bytes(),
+    };
 
-    let mut all_nodes = file_cfg.nodes;
-    all_nodes.extend_from_slice(node_args);
+    let specs = if force_local {
+        vec![NodeSpec::local_default()]
+    } else {
+        let mut all_nodes = file_cfg.nodes;
+        all_nodes.extend_from_slice(node_args);
+        collect_node_specs(&all_nodes, nodes_csv, streams)?
+    };
 
-    let specs = collect_node_specs(&all_nodes, nodes_csv, streams)?;
     Ok(ResolvedCluster {
         specs,
         token,
@@ -579,8 +643,51 @@ fn print_probe_table(probed: &[resource::ProbedNode]) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    dispatch(cli)
+}
 
+fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Do { request, dry_run } => {
+            let joined = request.join(" ");
+            let resolved_args = nl::parse_natural_command(&joined)?;
+            println!("[squiz-archive] Resolved: squiz-archive {}", resolved_args.join(" "));
+            if dry_run {
+                return Ok(());
+            }
+            let mut argv = vec!["squiz-archive".to_string()];
+            argv.extend(resolved_args);
+            let parsed = Cli::try_parse_from(argv)?;
+            dispatch(parsed)
+        }
+
+        Commands::Init {
+            output,
+            nodes,
+            security,
+        } => {
+            let _ = SecurityMode::from_str(&security)?;
+            let remote_list: Vec<String> = nodes
+                .as_deref()
+                .map(|csv| {
+                    csv.split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            if s.contains(':') {
+                                s.to_string()
+                            } else {
+                                format!("{}:7878", s)
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            run_init_wizard(output.as_deref(), &remote_list, &security)
+        }
+
+        Commands::Doctor => run_doctor(),
+
         Commands::Worker {
             bind,
             token,
@@ -608,11 +715,13 @@ fn main() -> Result<()> {
             cluster,
             node,
             nodes,
+            local,
             token,
             security,
         } => {
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -633,6 +742,7 @@ fn main() -> Result<()> {
             source,
             output,
             cluster,
+            local,
             exclude,
             preset,
             codec,
@@ -662,6 +772,7 @@ fn main() -> Result<()> {
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -710,6 +821,7 @@ fn main() -> Result<()> {
             input,
             output,
             cluster,
+            local,
             mem_limit,
             node,
             nodes,
@@ -725,6 +837,7 @@ fn main() -> Result<()> {
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -761,6 +874,7 @@ fn main() -> Result<()> {
             input,
             output,
             cluster,
+            local,
             preset,
             codec,
             level,
@@ -816,6 +930,7 @@ fn main() -> Result<()> {
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -864,6 +979,7 @@ fn main() -> Result<()> {
             input,
             output,
             cluster,
+            local,
             mem_limit,
             node,
             nodes,
@@ -880,6 +996,7 @@ fn main() -> Result<()> {
             let sched = ScheduleMode::from_str(&schedule)?;
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -919,6 +1036,7 @@ fn main() -> Result<()> {
             input,
             workdir,
             cluster,
+            local,
             preset,
             codec,
             level,
@@ -940,6 +1058,7 @@ fn main() -> Result<()> {
             };
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                local,
                 &node,
                 nodes.as_deref(),
                 &token,
@@ -1097,6 +1216,7 @@ fn main() -> Result<()> {
         } => {
             let rc = resolve_cluster(
                 cluster.as_ref(),
+                false,
                 &node,
                 nodes.as_deref(),
                 &token,
