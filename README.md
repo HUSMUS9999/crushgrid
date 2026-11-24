@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-hero-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-hero-light.svg" />
-    <img src="assets/crushgrid-hero-light.svg" alt="CrushGrid — Distributed Multi-Node Compression &amp; Archival" width="400" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-press-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-press-light.svg" />
+    <img src="assets/crushgrid-press-light.svg" alt="CrushGrid — Distributed Multi-Node Compression &amp; Archival" width="400" />
   </picture>
 </p>
 
