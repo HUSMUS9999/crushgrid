@@ -22,6 +22,12 @@
 
 **CrushGrid** *(formerly `squiz-archive`, 100% `.sqz` archive & wire-protocol compatible)* distributes file and directory compression across multiple machines over LAN, Tailscale/WireGuard VPNs, or cloud networks. It compiles to a **single static Rust executable** bundling `libzstd`, `liblzma`, `libbzip3`, pure-Rust `PPMd7`, and `LZ4`, running identically as coordinator or worker on Linux, Windows, and macOS.
 
+## Problem & Solution
+
+**Problem:** High-ratio archival (`zstd -19`, `xz -6`) saturates a single machine for hours while spare workstations and servers on the same LAN or VPN sit idle. Standard archivers also force one global codec across mixed workloads — leaving ratio on the table across text, executables, and pre-compressed media — and produce monolithic streams that prevent parallel extraction and slab deduplication.
+
+**Solution:** CrushGrid splits datasets into content-classified, `BLAKE3`-deduplicated slabs and distributes compression across `2` to `100+` Linux, Windows, and macOS nodes over `AES-256-GCM`-authenticated TCP using a pull-based work-stealing scheduler. Each slab is automatically routed to the best statically bundled codec (`Bzip3`, `LZMA2+BCJ`, `PPMd7`, `Zstd`, `LZ4`, or raw bypass) inside a seekable `.sqz` v3 archive that extracts in parallel.
+
 ## Features
 
 - **Distributed Multi-Node Work-Stealing (`2` to `100+` Hosts)** — Pull-based credit-gated scheduler across heterogeneous Linux, Windows, and macOS nodes with automatic offline-node failover and adaptive wire pre-shrinking
