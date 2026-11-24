@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-press-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-press-light.svg" />
-    <img src="assets/crushgrid-press-light.svg" alt="CrushGrid — Distributed Multi-Node Compression &amp; Archival" width="400" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-emblem-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-emblem-light.svg" />
+    <img src="assets/crushgrid-emblem-light.svg" alt="CrushGrid — Distributed Multi-Node Compression &amp; Archival" width="380" />
   </picture>
 </p>
 
@@ -87,15 +87,13 @@ Power users can override any preset with `--codec zstd|bzip3|ppmd|lzma2|lzma2-bc
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    IN["Files / Directories"] --> S["Slab Scanner + Content Classifier + BLAKE3 Dedup"]
-    S --> Q["Pull-Based Credit Scheduler (AIMD + ByteBudget)"]
-    Q -->|"Local Workers"| L["Local Codec Pool (Zstd / Bzip3 / PPMd7 / LZMA2+BCJ / LZ4)"]
-    Q -->|"AES-256-GCM Framed TCP"| W1["Remote Worker Node 1..N"]
-    L --> C[".sqz v3 Seekable Archive (O(1) Parallel Unpack)"]
-    W1 --> C
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-arch-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-arch-light.svg" />
+    <img src="assets/crushgrid-arch-light.svg" alt="CrushGrid Distributed Compression Pipeline Architecture" width="100%" />
+  </picture>
+</p>
 
 ---
 
