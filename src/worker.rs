@@ -1,5 +1,6 @@
 use crate::codec::{
-    CodecId, compress_block, decompress_block, wire_expand_zstd1, wire_shrink_zstd1,
+    CodecId, compress_block, decompress_block, wire_expand_lz4, wire_expand_zstd1,
+    wire_shrink_zstd1,
 };
 use crate::pool::ByteBudget;
 use crate::protocol::{
@@ -209,7 +210,28 @@ fn handle_connection(
             }
             MsgType::JobReq => {
                 let payload = std::mem::take(&mut rx_buf);
-                let budget_bytes = payload.len().saturating_add(hdr.orig_len as usize).max(4096);
+                let orig_len = hdr.orig_len as usize;
+                // Enforce hard max_frame on orig_len BEFORE allocating or spawning (blocks decompression-bomb OOM DoS!)
+                if orig_len > max_frame {
+                    let err_bytes = format!(
+                        "job orig_len {} exceeds hard worker max_frame {}",
+                        orig_len, max_frame
+                    )
+                    .into_bytes();
+                    let resp_hdr = FrameHeader {
+                        msg_type: MsgType::Error,
+                        codec: hdr.codec,
+                        level: hdr.level,
+                        flags: 0,
+                        chunk_id: hdr.chunk_id,
+                        orig_len: 0,
+                        payload_len: err_bytes.len() as u32,
+                        xxh3: 0,
+                    };
+                    let _ = resp_tx.send((resp_hdr, err_bytes));
+                    continue;
+                }
+                let budget_bytes = payload.len().saturating_add(orig_len).max(4096);
                 let mem_guard = mem_budget.acquire(budget_bytes);
                 let slot_guard = slot_sem.acquire();
                 let resp_tx_c = resp_tx.clone();
@@ -227,8 +249,7 @@ fn handle_connection(
                     let raw_input_res: Result<Vec<u8>> = if wire_zstd1 {
                         wire_expand_zstd1(&payload, hdr.orig_len as usize)
                     } else if wire_lz4 {
-                        lz4_flex::block::decompress_size_prepended(&payload)
-                            .map_err(|e| anyhow::anyhow!("wire lz4 expand failed: {}", e))
+                        wire_expand_lz4(&payload, hdr.orig_len as usize)
                     } else {
                         Ok(payload)
                     };

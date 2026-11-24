@@ -8,6 +8,8 @@ Every node runs the same executable:
 
 ## 1. Generate a Shared Cluster Token
 
+The fastest way to create a `0600` `cluster.conf` with a 256-bit OS CSPRNG token is `squiz-archive init --nodes <host1:7878,host2:7878>`. To generate a token manually:
+
 All connections perform mutual `BLAKE3` challenge-response authentication using a pre-shared token and 32-byte OS CSPRNG nonces, deriving a per-session 256-bit `AES-256-GCM` key (note: PSK derivation does not provide forward secrecy; rotate tokens periodically or run over WireGuard/Tailscale).
 
 ```bash
@@ -88,7 +90,7 @@ When connecting to workers on AWS, Hetzner, GCP, DigitalOcean, or VPS providers 
    - Set `wire_codec = zstd1` to shrink compressible slabs before upload.
    - Set `streams = 4` to `8` (`1..=8` supported) to fill high-RTT WAN Bandwidth-Delay Product.
    - Set per-node `bw=10M` inside a `node = ...` line if you want to cap uplink usage (`bw=` is in **bytes/sec**, so `10M` = 10 MiB/s ≈ 84 Mbps). `bw` is a per-node option, not a top-level config key.
-   - Use CPU-heavy presets (`zstd --level 15..22` or `lzma2 --level 6..9`) so remote compute outweighs WAN latency.
+   - Use CPU-heavy presets (`--preset small` / `--preset max`) or explicit codec/level flags (`--codec zstd --level 15..22`, `--codec lzma2 --level 6..9`) so remote compute outweighs WAN latency.
 
 ## 5. Persistent Background Services
 

@@ -390,11 +390,11 @@ fn derive_session_key(psk: &[u8; 32], client_nonce: &[u8; 32], server_nonce: &[u
     blake3::derive_key("hpc-squizze-v1-session-key", &material)
 }
 
-/// Deep OS-aware TCP socket tuning for Wi-Fi 6 / Gigabit / 2.5GbE / Tailscale links:
+/// Deep OS-aware TCP socket tuning for LAN / Wi-Fi / WAN / Tailscale links:
 /// - `TCP_NODELAY` (paired with single-syscall coalesced framing -> zero tiny segments + zero Nagle stall)
 /// - Linux: per-socket `TCP_CONGESTION=bbr`, `TCP_NOTSENT_LOWAT=128KiB`, `TCP_QUICKACK=1`,
-///   preserves kernel dynamic `tcp_moderate_rcvbuf` autotuning up to 16 MiB, sets DSCP AF41 (`0x88`) for WMM QoS!
-/// - Windows: 4 MiB Winsock send/recv buffers + TCP Keepalive!
+///   preserves kernel dynamic `tcp_moderate_rcvbuf` autotuning, keeps `IP_TOS=0x00` (WMM AC_BE).
+/// - Windows/macOS: 4 MiB socket send/recv buffers + TCP Keepalive.
 pub fn tune_tcp_stream(stream: &TcpStream) -> Result<()> {
     stream.set_nodelay(true)?;
     let sock = socket2::SockRef::from(stream);

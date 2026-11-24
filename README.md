@@ -9,15 +9,56 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
 </p>
 
-`squiz-archive` distributes file and directory compression across multiple machines over LAN, VPN (Tailscale/WireGuard), or cloud networks. It ships as a single ~2.4 MiB executable with statically linked `libzstd` and `liblzma` codecs (plus pure-Rust LZ4). The same binary runs as coordinator or worker on Linux and Windows (macOS builds from source).
+`squiz-archive` distributes file and directory compression across multiple machines over LAN, VPN (Tailscale/WireGuard), or cloud networks. It ships as a single executable with statically bundled `libzstd`, `liblzma`, and `libbzip3` (plus pure-Rust PPMd7 and LZ4). The same binary runs as coordinator or worker on Linux and Windows (macOS builds from source).
 
-## Overview
+## Quick Start
 
-- **Multi-node scaling:** Add any number of local, LAN, VPN, or cloud workers via `--cluster cluster.conf`, repeated `--node` flags, or interactive selection (`-i` / `--pick`).
-- **Resource ceilings:** Cap threads (`N`, `N%`, `auto`, `max`), coordinator RAM (`--mem-limit`, default `2G`), and per-node TX bandwidth (`bw=` in bytes/sec). Workers enforce server-side `--max-threads` and `--max-mem` (default `4G`) ceilings.
-- **Codecs and deduplication:** Zstd (with Long-Distance Matching enabled on slabs >= 1 MiB), LZMA2 (`liblzma`), and LZ4 (`lz4_flex`). `.sqz` directory archives group files into solid blocks by file class and extension, deduplicate identical slabs via `BLAKE3`, and store incompressible slabs raw after a `<0.05 ms` LZ4 entropy probe.
-- **Seekable formats:** `.zst` writes standard Zstd Seekable Format (`0x184D2A5E`), readable by upstream `zstd -d` or `squiz-archive decompress` (`decompress` requires seekable `.zst` or `.sqz`). `.sqz` adds a compressed directory manifest, per-slab `XXH3-64` checksums, and a whole-stream `BLAKE3` digest verified on single-file `decompress`.
-- **Transport security:** Mutual `BLAKE3` PSK challenge-response (32-byte OS CSPRNG nonces, constant-time MAC check) followed by per-session 256-bit `AES-256-GCM` with header AAD (`--security aead`, default). Host capabilities are sent only after authentication succeeds. `--security auth-only` is opt-in (requires worker `--allow-auth-only`) for already-encrypted WireGuard/Tailscale tunnels.
+You do not need to know compression algorithms or tune flags to get started.
+
+```bash
+# 1. Local compression with smart defaults (creates ./backups.sqz)
+squiz-archive pack ./backups
+
+# 2. Higher compression without learning codec flags
+squiz-archive pack ./backups --preset small
+
+# 3. Extract in parallel (creates ./backups)
+squiz-archive unpack backups.sqz
+
+# 4. Plain-English command mode (prints the resolved CLI command; add --dry-run to preview)
+squiz-archive do "compress ./logs as small as possible using 50% cpu"
+```
+
+### Multi-Node Cluster Setup (2 to 100+ hosts)
+
+```bash
+# Generate a 256-bit CSPRNG token and ~/.config/squiz-archive/cluster.conf (0600 on Unix)
+squiz-archive init --nodes 192.168.1.40:7878,100.64.0.10:7878
+
+# Start a worker on each contributing host (reads SQUIZ_TOKEN from env)
+export SQUIZ_TOKEN="<token-from-init>"
+squiz-archive worker --bind 0.0.0.0:7878 --max-mem 8G
+
+# Verify hardware, config, and OS TCP tuning
+squiz-archive doctor
+squiz-archive probe
+
+# Run on your cluster (auto-discovers cluster.conf; add -i / --pick to select nodes interactively)
+squiz-archive pack ./dataset --preset small
+```
+
+Run `squiz-archive -h` or `squiz-archive <command> -h` to list all commands and flags.
+
+## Presets
+
+| Preset (`-m` / `--preset`) | Behavior | When to Use |
+|---|---|---|
+| `fast` | Zstd L3 | Fast scratch backups and high-speed links |
+| `balanced` *(default)* | Zstd L9 + LDM | Everyday compression speed and ratio |
+| `small` | Per-slab auto: Bzip3 (text/CSV), LZMA2+BCJ (x86 binaries), LZMA2 L6 (mixed), raw bypass (already compressed) | High ratio without slow LZMA2-only wall times |
+| `max` | Per-slab auto: Bzip3 16M (text/code), LZMA2+BCJ L9 (binaries), LZMA2 L9 (mixed) | Cold archival storage where smallest size matters |
+
+Power users can override any preset with `--codec zstd|bzip3|ppmd|lzma2|lzma2-bcj|lz4|auto` and `--level N`.
 
 ## Install
 
@@ -27,95 +68,52 @@ Download prebuilt binaries from [Releases](https://github.com/HUSMUS9999/squiz-a
 git clone https://github.com/HUSMUS9999/squiz-archive.git
 cd squiz-archive
 
-# Native build (AVX2 / AVX-512 / AES-NI)
+# Native CPU tuning (AVX2 / AVX-512 / AES-NI)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
-
-# Portable x86_64-v3 + AES-NI build (Linux)
-RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq" cargo build --release
 
 # Cross-compile Windows .exe from Linux (requires mingw-w64)
 rustup target add x86_64-pc-windows-gnu
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq" cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-## Usage
-
-### 1. Start workers
-
-```bash
-# Generate a shared token once: openssl rand -hex 32
-export SQUIZ_TOKEN="<64-hex-char-token>"
-
-# Worker reads SQUIZ_TOKEN from the environment (hard ceilings enforced server-side)
-squiz-archive worker --bind 0.0.0.0:7878 --max-threads 16 --max-mem 8G
-```
-
-### 2. Configure nodes (`cluster.conf`)
-
-Copy `cluster.conf.example` and add as many LAN, VPN, or cloud workers as needed:
-
-```ini
-token = <64-hex-char-token>
-security = aead
-wire_codec = auto
-mem_limit = 4G
-streams = 2
-
-node = local:threads=auto,mem=4G
-node = 192.168.1.40:7878:threads=max,mem=8G
-node = 100.64.0.10:7878:threads=max,mem=16G
-# bw= is in bytes/sec (e.g. 10M = 10 MiB/s ~= 84 Mbps)
-node = worker1.example.com:7878:threads=32,mem=16G,streams=6,bw=10M
-```
-
-### 3. Probe, pack, compress, and extract
-
-```bash
-# Check reachability, CPU/RAM ceilings, RTT, and link throughput
-squiz-archive probe --cluster cluster.conf
-
-# Pack a directory (add -i / --pick to toggle nodes and limits interactively)
-squiz-archive pack /path/to/data -o backup.sqz --cluster cluster.conf --codec zstd --level 12 --block-size 8M
-
-# Inspect metadata, dedup savings, and file list
-squiz-archive inspect backup.sqz --list
-
-# Extract a directory archive
-squiz-archive unpack backup.sqz -o ./restored --cluster cluster.conf
-
-# Single-file seekable .zst (upstream `zstd -d` compatible)
-squiz-archive compress large.bin -o large.bin.zst --cluster cluster.conf --codec zstd --level 19
-squiz-archive decompress large.bin.zst -o large.bin --cluster cluster.conf
-
-# Local-vs-cluster and wire throughput benchmarks
-squiz-archive bench sample.bin --cluster cluster.conf --codec zstd --level 19
-squiz-archive net-bench --cluster cluster.conf --streams 4
-```
-
-See [`docs/CLUSTER_SETUP.md`](docs/CLUSTER_SETUP.md) for LAN firewalls, Tailscale/WireGuard meshes, public cloud deployment (`systemd`, Windows Scheduled Task), and optional OS TCP tuning scripts (`scripts/tune-linux.sh`, `scripts/tune-windows.ps1`).
-
 ## Benchmarks
 
-Measured on a 3-node testbed over a shared 5 GHz wireless LAN (~150 Mbps bidirectional ceiling) with `AES-256-GCM` enabled (`--security aead`) and `BLAKE3` round-trip verification:
+### Single-Core Codec Comparison (8 MiB Real Workloads)
 
-- Coordinator: Windows x86_64, 6C/12T (2.6 GHz), 16 GiB RAM
+| Codec | CSV Telemetry (8 MiB) | ELF Binaries (8 MiB) | C Headers (4 MiB) |
+|---|---|---|---|
+| `zstd L9` | 4.20x (68.3 MiB/s) | 2.54x (71.2 MiB/s) | 7.28x (109.1 MiB/s) |
+| `zstd L19` | 4.91x (2.1 MiB/s) | 2.79x (4.6 MiB/s) | 8.16x (5.2 MiB/s) |
+| `bzip3` (BWT+LZP+CM) | 4.70x (15.5 MiB/s) | 2.79x (13.1 MiB/s) | **8.81x** (20.5 MiB/s) |
+| `ppmd` (PPMd7 order 8) | 4.55x (9.8 MiB/s) | 2.79x (7.4 MiB/s) | 8.70x (28.6 MiB/s) |
+| `lzma2 L6` | 4.89x (2.5 MiB/s) | 2.96x (3.6 MiB/s) | 8.39x (5.1 MiB/s) |
+| `lzma2-bcj L6` (x86) | 4.89x (2.7 MiB/s) | **3.13x** (3.5 MiB/s) | 8.39x (4.8 MiB/s) |
+
+### 3-Node Cluster Testbed (Shared 5 GHz Wireless LAN, `AES-256-GCM` Enabled)
+
+- Coordinator: Windows x86_64, 6C/12T (2.6 GHz), 16 GiB RAM (10T compute, 2T reserved for I/O)
 - Worker 1: Linux x86_64, 16C/32T (2.5-5.4 GHz), 30 GiB RAM
 - Worker 2: Linux x86_64, 12C/20T (2.1-4.9 GHz), 62 GiB RAM
 
-With `threads=auto` and remote workers active, 2 local threads are reserved on the coordinator for network I/O and encryption (62 active compute threads total: 10 + 32 + 20).
-
-| Workload | Codec | Local (12T) | Cluster (62T) | Speedup | Ratio |
-|---|---|---:|---:|---:|---:|
-| 256 MiB mixed-entropy | `zstd L19` (2M blk) | 21.26 s (12.0 MiB/s) | 7.30 s (35.1 MiB/s) | 2.91x | 3.69x |
-| 256 MiB mixed-entropy | `lzma2 L6` (2M blk) | 6.13 s (41.7 MiB/s) | 3.82 s (67.1 MiB/s) | 1.61x | 3.71x |
-| 128 MiB PE binaries | `lzma2 L6` (2M blk) | 5.59 s (22.9 MiB/s) | 3.23 s (39.6 MiB/s) | 1.73x | 3.38x |
-| 1.25 GiB directory (23k files) | `zstd L12` (`.sqz`, 4M) | - | 90.6 s (312 MiB out) | - | 4.11x |
+| Workload | Preset / Codec | Local (12T) | Cluster (62T) | Speedup | Ratio |
+|---|---|---|---|---:|---:|
+| 256 MiB CSV dataset | `zstd L19` (8M blk) | 8.3 MiB/s | 23.3 MiB/s | 2.81x | 4.94x |
+| 256 MiB CSV dataset | `lzma2 L6` (8M blk) | 10.9 MiB/s | 28.8 MiB/s | 2.65x | 4.92x |
+| 256 MiB mixed-entropy | `zstd L19` (2M blk) | 12.0 MiB/s | 35.1 MiB/s | 2.91x | 3.69x |
+| 128 MiB PE binaries | `lzma2 L6` (2M blk) | 22.9 MiB/s | 39.6 MiB/s | 1.73x | 3.38x |
+| 1.25 GiB directory (23k files) | `zstd L12` (`.sqz`) | - | 90.6 s (312 MiB out) | - | 4.11x |
 | 185.5 GiB CSV dataset (107 files) | `zstd L9` (`.sqz`, 8M) | - | 2748 s (45.2 GiB out, 69.1 MiB/s) | - | 4.10x |
 | 256 MiB parallel decompress | `zstd` (`auto`) | 0.10 s (2566 MiB/s) | 0.12 s (2108 MiB/s) | 0.83x* | - |
 
-*\*In `auto` mode, fast Zstd decompression stays local because local decode speed exceeds wireless RX bandwidth; the 20 ms delta is cluster setup overhead. Use `--schedule force-all` to force remote decompression on fast wired links.*
+*\*In `auto` mode, fast Zstd decompression stays local because local decode throughput exceeds wireless RX bandwidth; the 20 ms delta is cluster setup overhead.*
 
-On wired Gigabit, 2.5GbE, 10GbE, or cloud VPC links, scaling is compute-bound rather than link-bound.
+## Documentation
+
+- [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md): Codec selection guide, per-slab auto-routing, and empirical trade-offs
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): Pipeline design, `.sqz` v3 binary format, wire protocol, and security model
+- [`docs/CLUSTER_SETUP.md`](docs/CLUSTER_SETUP.md): LAN, Tailscale/WireGuard, cloud deployment (`systemd`, Windows Task), and OS TCP tuning scripts (`scripts/`)
+- [`docs/CLI_REFERENCE.md`](docs/CLI_REFERENCE.md): Complete command, preset, natural-language, and flag reference
+- [`CHANGELOG.md`](CHANGELOG.md): Release history
 
 ## License
 

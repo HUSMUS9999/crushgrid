@@ -5,39 +5,57 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
-/// Automatically locate a saved `cluster.conf` if the user did not pass `--cluster`, `--node`, or `--local`.
+/// Automatically locate a saved user/system `cluster.conf` if the user did not pass `--cluster`, `--node`, or `--local`.
+/// Deliberately skips CWD `./cluster.conf` so running inside an untrusted directory/repo cannot redirect data to an attacker's worker.
 /// Search order:
-/// 1. `./cluster.conf`
-/// 2. `~/.config/squiz-archive/cluster.conf` (or `%APPDATA%\squiz-archive\cluster.conf` on Windows)
+/// 1. `$XDG_CONFIG_HOME/squiz-archive/cluster.conf` (Unix)
+/// 2. `~/.config/squiz-archive/cluster.conf` (Unix) / `%APPDATA%\squiz-archive\cluster.conf` (Windows)
 /// 3. `/etc/squiz-archive/cluster.conf` (Unix)
 pub fn discover_default_cluster_config() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("cluster.conf")];
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
     if let Ok(appdata) = std::env::var("APPDATA") {
         candidates.push(PathBuf::from(appdata).join("squiz-archive").join("cluster.conf"));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("squiz-archive")
-                .join("cluster.conf"),
-        );
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                candidates.push(PathBuf::from(xdg).join("squiz-archive").join("cluster.conf"));
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("squiz-archive")
+                    .join("cluster.conf"),
+            );
+        }
+        candidates.push(PathBuf::from("/etc/squiz-archive/cluster.conf"));
     }
-    #[cfg(unix)]
-    candidates.push(PathBuf::from("/etc/squiz-archive/cluster.conf"));
 
     candidates.into_iter().find(|p| p.is_file())
 }
 
 pub fn default_user_config_path() -> PathBuf {
+    #[cfg(windows)]
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata).join("squiz-archive").join("cluster.conf");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("squiz-archive")
-            .join("cluster.conf");
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("squiz-archive").join("cluster.conf");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".config")
+                .join("squiz-archive")
+                .join("cluster.conf");
+        }
     }
     PathBuf::from("cluster.conf")
 }
@@ -50,12 +68,25 @@ pub fn auto_mem_limit_bytes() -> usize {
 }
 
 /// Interactive or non-interactive cluster setup wizard (`squiz-archive init`).
-pub fn run_init_wizard(output: Option<&Path>, remote_nodes: &[String], security: &str) -> Result<()> {
+/// Creates the config file atomically with `0600` permissions on Unix and refuses to overwrite without `--force`.
+pub fn run_init_wizard(
+    output: Option<&Path>,
+    remote_nodes: &[String],
+    security: &str,
+    force: bool,
+) -> Result<()> {
     use rand::RngCore;
     let info = probe_local_system();
     let out_path = output
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_user_config_path);
+
+    if out_path.exists() && !force {
+        bail!(
+            "config already exists at {} (pass --force to overwrite)",
+            out_path.display()
+        );
+    }
 
     let mut key_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key_bytes);
@@ -79,11 +110,7 @@ pub fn run_init_wizard(output: Option<&Path>, remote_nodes: &[String], security:
         for part in line.trim().split(',') {
             let p = part.trim();
             if !p.is_empty() {
-                peers.push(if p.contains(':') {
-                    p.to_string()
-                } else {
-                    format!("{}:7878", p)
-                });
+                peers.push(p.to_string());
             }
         }
     }
@@ -98,7 +125,15 @@ pub fn run_init_wizard(output: Option<&Path>, remote_nodes: &[String], security:
     conf.push_str("streams = 2\n\n");
     conf.push_str(&format!("node = local:threads=auto,mem={}G\n", mem_gb.max(1)));
     for p in &peers {
-        conf.push_str(&format!("node = {}:threads=max,mem=4G,streams=2\n", p));
+        // Validate spec and preserve user-provided options if already present; omit mem= so worker's own --max-mem governs.
+        let _ = NodeSpec::parse(p)?;
+        if p.contains('=') {
+            conf.push_str(&format!("node = {}\n", p));
+        } else if p.contains(':') {
+            conf.push_str(&format!("node = {}:threads=max,streams=2\n", p));
+        } else {
+            conf.push_str(&format!("node = {}:7878:threads=max,streams=2\n", p));
+        }
     }
 
     if let Some(parent) = out_path.parent() {
@@ -106,17 +141,49 @@ pub fn run_init_wizard(output: Option<&Path>, remote_nodes: &[String], security:
             fs::create_dir_all(parent)?;
         }
     }
-    fs::write(&out_path, &conf)?;
+
+    // Atomic 0600 file creation on Unix (zero TOCTOU secret exposure window)
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).mode(0o600);
+        if force {
+            opts.create(true).truncate(true);
+        } else {
+            opts.create_new(true);
+        }
+        let mut file = opts
+            .open(&out_path)
+            .with_context(|| format!("failed creating {}", out_path.display()))?;
+        file.write_all(conf.as_bytes())?;
+        // Ensure 0600 even if overwriting an existing broader-mode file with --force
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed setting 0600 permissions on {}", out_path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true);
+        if force {
+            opts.create(true).truncate(true);
+        } else {
+            opts.create_new(true);
+        }
+        let mut file = opts
+            .open(&out_path)
+            .with_context(|| format!("failed creating {}", out_path.display()))?;
+        file.write_all(conf.as_bytes())?;
     }
 
     println!("\nWrote cluster config to: {}", out_path.display());
-    println!("Token generated via OS CSPRNG (256-bit). Permissions restricted (0600 on Unix).");
+    println!("Token generated via OS CSPRNG (256-bit). Permissions set to 0600 on Unix.");
     if !peers.is_empty() {
         println!("\nStart workers on each remote machine with:");
+        #[cfg(windows)]
+        println!("  $env:SQUIZ_TOKEN = \"{}\"", token);
+        #[cfg(not(windows))]
         println!("  export SQUIZ_TOKEN=\"{}\"", token);
         println!("  squiz-archive worker --bind 0.0.0.0:7878 --max-mem 8G");
     }
@@ -138,7 +205,26 @@ pub fn run_doctor() -> Result<()> {
     );
 
     match discover_default_cluster_config() {
-        Some(p) => println!("  Cluster Config  : {} (auto-detected)", p.display()),
+        Some(p) => {
+            let status = match load_cluster_file(&p) {
+                Ok(c) => format!("valid, {} node(s)", c.nodes.len()),
+                Err(e) => format!("INVALID: {}", e),
+            };
+            println!("  Cluster Config  : {} ({})", p.display(), status);
+            #[cfg(unix)]
+            if let Ok(meta) = fs::metadata(&p) {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    println!(
+                        "  Security Warn   : {} has mode {:04o}; run `chmod 600 {}`",
+                        p.display(),
+                        mode,
+                        p.display()
+                    );
+                }
+            }
+        }
         None => println!("  Cluster Config  : none found (run `squiz-archive init` to create one)"),
     }
 
@@ -152,10 +238,15 @@ pub fn run_doctor() -> Result<()> {
             .unwrap_or_else(|_| "0".into());
         let cc_trim = cc.trim();
         let rmem_val: u64 = rmem.trim().parse().unwrap_or(0);
+        let rmem_str = if rmem_val >= 1024 * 1024 {
+            format!("{:.1} MiB", rmem_val as f64 / 1048576.0)
+        } else {
+            format!("{} KiB", rmem_val / 1024)
+        };
         println!(
-            "  Linux TCP Stack : congestion={} | rmem_max={} MiB | mtu_probing={}",
+            "  Linux TCP Stack : congestion={} | rmem_max={} | mtu_probing={}",
             cc_trim,
-            rmem_val / (1024 * 1024),
+            rmem_str,
             mtu_probe.trim()
         );
         if cc_trim != "bbr" || rmem_val < 8 * 1024 * 1024 {
@@ -186,13 +277,28 @@ pub struct ClusterFileConfig {
     pub nodes: Vec<String>,
 }
 
+/// Strip inline `#` comments outside of single or double quotes.
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Load an N-node cluster config file (`cluster.conf`) supporting arbitrary numbers of LAN/Tailscale/Cloud workers.
 pub fn load_cluster_file(path: &Path) -> Result<ClusterFileConfig> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed reading cluster config {}", path.display()))?;
     let mut cfg = ClusterFileConfig::default();
     for (lineno, raw_line) in text.lines().enumerate() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = strip_unquoted_comment(raw_line).trim();
         if line.is_empty() {
             continue;
         }

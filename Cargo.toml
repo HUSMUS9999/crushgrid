@@ -1,6 +1,6 @@
 [package]
 name = "squiz-archive"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "Distributed multi-node compression and archival CLI (Zstd, Bzip3, PPMd, LZMA2+BCJ, LZ4) with BLAKE3 dedup and AES-256-GCM"

@@ -8,7 +8,7 @@ pub const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184D_2A5E;
 pub const ZSTD_SEEKABLE_FOOTER_MAGIC: u32 = 0x8F92_EAB1;
 
 /// `.sqz` / `.hsq` container header & footer constants.
-/// Supports v1 (legacy single-file) and v2 (BLAKE3 dedup + zero-CPU raw slab bypass + embedded directory manifest!).
+/// Supports v1 (legacy `.hsq`), v2 (`.sqz`), and v3 (per-slab multi-codec + BLAKE3 dedup + raw bypass + directory manifest).
 pub const HSQ_HEADER_MAGIC: [u8; 4] = *b"HSQZ";
 pub const SQZ_HEADER_MAGIC: [u8; 4] = *b"SQZA";
 pub const HSQ_FOOTER_MAGIC: [u8; 8] = *b"ZQSH_V01";
@@ -28,7 +28,7 @@ pub const CHUNK_FLAG_DEDUP_REF: u8 = 2;
 pub enum ContainerFormat {
     /// Standard Zstd multi-frame + Zstd Seekable skippable footer (100% compatible with `zstd -d`)
     ZstdSeekable,
-    /// Universal Squiz Archive v2 container (`.sqz` / `.hsq`: Zstd LDM, LZMA2, LZ4, BLAKE3 dedup, raw bypass, directory manifest)
+    /// Universal Squiz Archive v3 container (`.sqz`: multi-codec, BLAKE3 dedup, raw bypass, directory manifest)
     Sqz,
 }
 
@@ -85,6 +85,8 @@ pub fn encode_file_manifest(files: &[PackedFileEntry]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub const MAX_MANIFEST_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard safety cap
+
 pub fn decode_file_manifest(blob: &[u8]) -> Result<Vec<PackedFileEntry>> {
     if blob.is_empty() {
         return Ok(Vec::new());
@@ -92,7 +94,15 @@ pub fn decode_file_manifest(blob: &[u8]) -> Result<Vec<PackedFileEntry>> {
     if blob.len() < 8 {
         bail!("truncated .sqz file manifest");
     }
-    let orig_len = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
+    let orig_len_u64 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
+    if orig_len_u64 > MAX_MANIFEST_UNCOMPRESSED_BYTES as u64 {
+        bail!(
+            "corrupted .sqz manifest: uncompressed size {} exceeds safety cap {}",
+            orig_len_u64,
+            MAX_MANIFEST_UNCOMPRESSED_BYTES
+        );
+    }
+    let orig_len = orig_len_u64 as usize;
     let raw = decompress_block(CodecId::Zstd, &blob[8..], orig_len)?;
     if raw.len() < 8 {
         bail!("corrupted .sqz file manifest payload");
@@ -276,6 +286,12 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
     let table_bytes = (num_chunks as usize)
         .checked_mul(SQZ_ENTRY_LEN)
         .context("overflow reading .sqz seek table")?;
+    let table_end = table_offset
+        .checked_add(table_bytes as u64)
+        .context("overflow computing .sqz seek table end")?;
+    if table_end > file_len.saturating_sub(HSQ_TRAILER_LEN as u64) {
+        bail!("corrupted .sqz seek table bounds (exceeds file length)");
+    }
     file.seek(SeekFrom::Start(table_offset))?;
     let mut raw = vec![0u8; table_bytes];
     file.read_exact(&mut raw)?;
@@ -285,7 +301,12 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
         let base = i * SQZ_ENTRY_LEN;
         let flags = raw[base + 32];
         let slab_codec = if version >= 3 {
-            CodecId::from_u8(raw[base + 33]).unwrap_or(codec)
+            let cid = raw[base + 33];
+            if cid == 0xFF {
+                codec
+            } else {
+                CodecId::from_u8(cid)?
+            }
         } else if (flags & CHUNK_FLAG_RAW_STORED) != 0 {
             CodecId::Raw
         } else {
@@ -304,6 +325,12 @@ fn read_sqz_v2_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
     }
 
     let files = if manifest_len > 0 {
+        let m_end = manifest_offset
+            .checked_add(manifest_len)
+            .context("overflow computing .sqz manifest end")?;
+        if m_end > file_len || manifest_len > MAX_MANIFEST_UNCOMPRESSED_BYTES as u64 {
+            bail!("corrupted .sqz manifest bounds (offset={}, len={}, file={})", manifest_offset, manifest_len, file_len);
+        }
         file.seek(SeekFrom::Start(manifest_offset))?;
         let mut mblob = vec![0u8; manifest_len as usize];
         file.read_exact(&mut mblob)?;
@@ -347,7 +374,15 @@ fn read_hsq_v1_manifest(file: &mut File, file_len: u64) -> Result<ArchiveManifes
         bail!("corrupted .hsq chunk count mismatch");
     }
 
-    let table_bytes = (num_chunks as usize) * HSQ_ENTRY_LEN;
+    let table_bytes = (num_chunks as usize)
+        .checked_mul(HSQ_ENTRY_LEN)
+        .context("overflow reading .hsq seek table")?;
+    let table_end = table_offset
+        .checked_add(table_bytes as u64)
+        .context("overflow computing .hsq seek table end")?;
+    if table_end > file_len.saturating_sub(HSQ_TRAILER_LEN as u64) {
+        bail!("corrupted .hsq seek table bounds (exceeds file length)");
+    }
     file.seek(SeekFrom::Start(table_offset))?;
     let mut raw = vec![0u8; table_bytes];
     file.read_exact(&mut raw)?;

@@ -17,7 +17,7 @@ security = aead
 # none  = disable wire pre-shrink
 wire_codec = auto
 
-# Coordinator hard RAM limit (default: 2G)
+# Coordinator hard RAM limit (defaults to 1/3 available RAM, clamped to 256 MiB..4 GiB)
 mem_limit = 4G
 
 # Default parallel TCP streams per remote node (clamped to 1..=8)

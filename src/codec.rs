@@ -132,35 +132,56 @@ pub enum SlabKind {
     Binary,
 }
 
+pub const MAX_DECODE_MEM_BYTES: usize = 64 * 1024 * 1024; // 64 MiB hard cap per decoder instance
+
 /// Fast (<0.05 ms) general-purpose content classifier for per-slab codec selection.
-/// Inspects up to 8 KiB across the slab to distinguish text/source/CSV, x86 executables, and general binary.
+/// Inspects up to 8 KiB across the slab to distinguish ASCII/UTF-8 text, x86 executables, and general binary.
 pub fn classify_slab_content(data: &[u8]) -> SlabKind {
     if data.is_empty() {
         return SlabKind::Binary;
     }
-    // Check ELF or Windows PE executable header
     if data.len() >= 4 && (&data[0..4] == b"\x7fELF" || (&data[0..2] == b"MZ" && data.len() > 64)) {
         return SlabKind::Executable;
     }
 
     let sample = &data[..data.len().min(8192)];
-    let mut printable = 0usize;
+    // Check valid UTF-8 text (trimming at most 3 trailing incomplete UTF-8 bytes at the 8 KiB slice boundary)
+    let mut text_bytes = 0usize;
+    let mut i = 0usize;
     let mut x86_opcodes = 0usize;
-    for &b in sample {
-        if (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
-            printable += 1;
-        }
-        // x86/x86-64 relative CALL (0xE8) and JMP (0xE9) instructions
+    while i < sample.len() {
+        let b = sample[i];
         if b == 0xE8 || b == 0xE9 {
             x86_opcodes += 1;
         }
+        if (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+            text_bytes += 1;
+            i += 1;
+        } else if b >= 0xC2 {
+            let seq_len = if b < 0xE0 {
+                2
+            } else if b < 0xF0 {
+                3
+            } else if b <= 0xF4 {
+                4
+            } else {
+                0
+            };
+            if seq_len >= 2 && i + seq_len <= sample.len() && std::str::from_utf8(&sample[i..i + seq_len]).is_ok() {
+                text_bytes += seq_len;
+                i += seq_len;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
     }
 
-    if printable * 100 >= sample.len() * 88 {
+    if text_bytes * 100 >= sample.len() * 88 {
         return SlabKind::Text;
     }
-    // Heuristic: dense x86 machine code inside solid binary slabs benefits strongly from BCJ
-    if x86_opcodes * 1000 >= sample.len() * 14 && printable * 100 < sample.len() * 55 {
+    if x86_opcodes * 1000 >= sample.len() * 14 && text_bytes * 100 < sample.len() * 55 {
         return SlabKind::Executable;
     }
     SlabKind::Binary
@@ -236,6 +257,23 @@ pub fn wire_shrink_zstd1(input: &[u8]) -> Result<Vec<u8>> {
         out.truncate(written);
         Ok(out)
     })
+}
+
+pub fn wire_expand_lz4(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    if input.len() < 4 {
+        bail!("truncated lz4 block");
+    }
+    let declared = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
+    if declared > MAX_DECODE_MEM_BYTES || (expected_len > 0 && declared != expected_len) {
+        bail!(
+            "lz4 declared size {} invalid (expected {}, cap {})",
+            declared,
+            expected_len,
+            MAX_DECODE_MEM_BYTES
+        );
+    }
+    lz4_flex::block::decompress_size_prepended(input)
+        .map_err(|e| anyhow::anyhow!("lz4 decompress failed: {}", e))
 }
 
 pub fn wire_expand_zstd1(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
@@ -373,6 +411,18 @@ pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) 
             Ok(out)
         }
         CodecId::Bzip3 => {
+            // Validate BZ3v1 header block size BEFORE allocating to block OOM DoS (BZ3v1: 5B magic + 4B LE block_size)
+            if input.len() < 9 || &input[0..5] != b"BZ3v1" {
+                bail!("invalid bzip3 frame header");
+            }
+            let declared_blk = u32::from_le_bytes(input[5..9].try_into().unwrap()) as usize;
+            if declared_blk == 0 || declared_blk > MAX_DECODE_MEM_BYTES {
+                bail!(
+                    "bzip3 declared block size {} exceeds hard safety limit {}",
+                    declared_blk,
+                    MAX_DECODE_MEM_BYTES
+                );
+            }
             let mut decoder = bzip3::read::Bz3Decoder::new(input)
                 .map_err(|e| anyhow::anyhow!("bzip3 decoder init failed: {}", e))?;
             let mut out = Vec::with_capacity(expected_orig_len);
@@ -392,6 +442,16 @@ pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) 
             }
             let order = input[0] as u32;
             let mem_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
+            if !(2..=16).contains(&order) {
+                bail!("ppmd7 order {} outside safe range 2..=16", order);
+            }
+            if (mem_size as usize) < 1024 || (mem_size as usize) > MAX_DECODE_MEM_BYTES {
+                bail!(
+                    "ppmd7 declared memory {} outside safe limit 1 KiB..={} MiB",
+                    mem_size,
+                    MAX_DECODE_MEM_BYTES / (1024 * 1024)
+                );
+            }
             let mut dec = ppmd_rust::Ppmd7Decoder::new(&input[5..], order, mem_size)
                 .map_err(|e| anyhow::anyhow!("ppmd7 decoder init failed: {}", e))?;
             let mut out = vec![0u8; expected_orig_len];
@@ -399,8 +459,7 @@ pub fn decompress_block(codec: CodecId, input: &[u8], expected_orig_len: usize) 
             Ok(out)
         }
         CodecId::Lz4 => {
-            let out = lz4_flex::block::decompress_size_prepended(input)
-                .map_err(|e| anyhow::anyhow!("lz4 decompress failed: {}", e))?;
+            let out = wire_expand_lz4(input, expected_orig_len)?;
             if out.len() != expected_orig_len {
                 bail!(
                     "lz4 decompressed size mismatch: got {}, expected {}",

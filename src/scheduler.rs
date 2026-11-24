@@ -1,7 +1,7 @@
 use crate::archiver::{MultiFileStreamReader, MultiFileUnpacker, build_pack_plan};
 use crate::codec::{
     CodecId, Preset, compress_block, decompress_block, is_likely_incompressible,
-    pick_auto_slab_codec, wire_expand_zstd1, wire_shrink_zstd1,
+    pick_auto_slab_codec, wire_expand_lz4, wire_expand_zstd1, wire_shrink_zstd1,
 };
 use crate::container::{
     CHUNK_FLAG_COMPRESSED, CHUNK_FLAG_DEDUP_REF, CHUNK_FLAG_RAW_STORED, ChunkIndexEntry,
@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -255,6 +255,8 @@ impl BandwidthPacer {
     }
 }
 
+const MAX_CHUNK_RETRIES: u32 = 3;
+
 struct WorkTask {
     chunk_id: u64,
     orig_offset: u64,
@@ -263,6 +265,7 @@ struct WorkTask {
     chunk_flags: u8,
     codec: CodecId,
     level: i32,
+    retries: AtomicU32,
     input: Arc<Vec<u8>>,
     _budget: Arc<BudgetGuard>,
 }
@@ -1007,6 +1010,7 @@ fn run_compress_stream(
             chunk_flags: CHUNK_FLAG_COMPRESSED,
             codec: slab_codec,
             level: slab_level,
+            retries: AtomicU32::new(0),
             input: Arc::new(buf),
             _budget: guard,
         });
@@ -1101,7 +1105,23 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
     let total_chunks = manifest.entries.len() as u64;
     let total_orig_size = manifest.total_orig_size;
 
-    let active_nodes = select_active_nodes(params.nodes, params.schedule, manifest.codec, true)?;
+    // Determine the slowest slab codec actually present in this archive for accurate cost-aware decompress routing
+    let effective_decode_codec = manifest
+        .entries
+        .iter()
+        .map(|e| e.slab_codec)
+        .min_by_key(|c| match c {
+            CodecId::Ppmd => 20u32,
+            CodecId::Bzip3 => 25,
+            CodecId::Lzma2 | CodecId::Lzma2Bcj => 65,
+            CodecId::Zstd => 220,
+            CodecId::Lz4 => 650,
+            CodecId::Raw => 2000,
+        })
+        .unwrap_or(manifest.codec);
+
+    let active_nodes =
+        select_active_nodes(params.nodes, params.schedule, effective_decode_codec, true)?;
     let has_remotes = active_nodes.iter().any(|n| !n.spec.is_local);
     let total_threads: usize = active_nodes
         .iter()
@@ -1330,6 +1350,7 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
             chunk_flags: entry.chunk_flags,
             codec: entry.slab_codec,
             level: 0,
+            retries: AtomicU32::new(0),
             input: Arc::new(comp_buf),
             _budget: guard,
         });
@@ -1852,8 +1873,7 @@ fn spawn_remote_worker_node(
                                             if (hdr.flags & FLAG_WIRE_ZSTD1) != 0 {
                                                 wire_expand_zstd1(&rx_buf, task.orig_len)
                                             } else if (hdr.flags & FLAG_WIRE_LZ4) != 0 {
-                                                lz4_flex::block::decompress_size_prepended(&rx_buf)
-                                                    .map_err(|e| anyhow::anyhow!("lz4: {}", e))
+                                                wire_expand_lz4(&rx_buf, task.orig_len)
                                             } else {
                                                 Ok(std::mem::take(&mut rx_buf))
                                             };
@@ -1893,8 +1913,23 @@ fn spawn_remote_worker_node(
                                 }
                                 MsgType::Error => {
                                     credits_rx.release_only();
+                                    let err_msg = String::from_utf8_lossy(&rx_buf);
                                     if let Some((task, _, _)) = entry {
-                                        let _ = work_tx_rx.send(task);
+                                        let tries = task.retries.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if tries <= MAX_CHUNK_RETRIES {
+                                            eprintln!(
+                                                "[remote {}#{}] chunk {} error (retry {}/{}): {}",
+                                                target_rx, sid, task.chunk_id, tries, MAX_CHUNK_RETRIES, err_msg
+                                            );
+                                            let _ = work_tx_rx.send(task);
+                                        } else {
+                                            eprintln!(
+                                                "[remote {}#{}] chunk {} failed permanently after {} retries: {}",
+                                                target_rx, sid, task.chunk_id, MAX_CHUNK_RETRIES, err_msg
+                                            );
+                                            job_done_rx.store(true, Ordering::Release);
+                                            break;
+                                        }
                                     }
                                 }
                                 _ => {
