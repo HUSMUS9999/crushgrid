@@ -1,12 +1,12 @@
 # CLI Reference
 
-Run `squiz-archive -h` or `squiz-archive <subcommand> -h` for live help.
+Run `crushgrid -h` or `crushgrid <subcommand> -h` for live help.
 
 ## Subcommands
 
 | Command | Aliases | Description |
 |---|---|---|
-| `do "<text>"` | `ask` | Translate a plain-English request into CLI flags and execute it (`--dry-run` to preview only) |
+| `do "<text>"` | `ask` | Translate a natural-language request into CLI flags and execute it (`--dry-run` to preview only) |
 | `init` | - | Setup wizard that generates a 256-bit CSPRNG token and `0600` `cluster.conf` (`--force` to overwrite) |
 | `doctor` | - | Inspect local CPU, RAM, auto-detected `cluster.conf`, built-in codecs, and OS TCP stack |
 | `worker` | - | Run a compute worker daemon with hard `--max-threads` and `--max-mem` ceilings |
@@ -47,10 +47,10 @@ Run `squiz-archive -h` or `squiz-archive <subcommand> -h` for live help.
 
 ## Auto-Discovery & Smart Defaults
 
-- **Cluster config discovery:** If none of `--cluster`, `--node`, `--nodes`, or `--local` are passed, `squiz-archive` checks only trusted user/system locations (never CWD `./cluster.conf`, preventing untrusted-directory exfiltration):
-  1. `$XDG_CONFIG_HOME/squiz-archive/cluster.conf` (Unix)
-  2. `~/.config/squiz-archive/cluster.conf` (Unix) / `%APPDATA%\squiz-archive\cluster.conf` (Windows)
-  3. `/etc/squiz-archive/cluster.conf` (Unix)
+- **Cluster config discovery:** If none of `--cluster`, `--node`, `--nodes`, or `--local` are passed, `crushgrid` checks only trusted user/system locations (never CWD `./cluster.conf`, preventing untrusted-directory exfiltration):
+  1. `$XDG_CONFIG_HOME/crushgrid/cluster.conf` (Unix)
+  2. `~/.config/crushgrid/cluster.conf` (Unix) / `%APPDATA%\crushgrid\cluster.conf` (Windows)
+  3. `/etc/crushgrid/cluster.conf` (Unix)
   Pass `--cluster ./cluster.conf` explicitly to use a config file in the current directory.
 - **Optional output paths (`-o`):** Omitting `-o` derives `<source>.sqz` for `pack`, `<input>.zst`/`.sqz` for `compress`, and `<archive-stem>` for `unpack`/`decompress`.
 - **Coordinator I/O reservation:** When `threads=auto` is used with remote workers active, 1-2 local logical threads are reserved for TCP/AEAD/disk I/O.
@@ -65,19 +65,19 @@ Format: `<target>[:key=value,key=value,...]`
 - `bw=` (alias `bandwidth=`): coordinator TX cap in **bytes/sec** (`10M` = 10 MiB/s ≈ 84 Mbps)
 - `streams=` (alias `s=`): parallel TCP streams per peer (`1..=8`)
 
-## Natural-Language Mode (`squiz-archive do`)
+## Natural-Language Mode (`crushgrid do`)
 
-`squiz-archive do` parses plain English offline without external APIs and always prints the exact command before executing. Use `--dry-run` to preview:
+`crushgrid do` parses natural language offline without external APIs and always prints the exact command before executing. Use `--dry-run` to preview:
 
 ```bash
-squiz-archive do --dry-run "compress ./backups as small as possible using 50% cpu and 2G ram"
-squiz-archive do "fast backup of ./logs locally"
-squiz-archive do "extract backups.sqz into ./restored"
-squiz-archive do "decompress file.sqz into file.bin"
-squiz-archive do "inspect backups.sqz and list files"
-squiz-archive do "check cluster nodes"
+crushgrid do --dry-run "compress ./backups as small as possible using 50% cpu and 2G ram"
+crushgrid do "fast backup of ./logs locally"
+crushgrid do "extract backups.sqz into ./restored"
+crushgrid do "decompress file.sqz into file.bin"
+crushgrid do "inspect backups.sqz and list files"
+crushgrid do "check cluster nodes"
 ```
 
 ## Environment Variables
 
-- `SQUIZ_TOKEN`: Shared cluster authentication token (preferred over `--token` CLI flag to keep secrets out of process lists and shell history).
+- `CRUSHGRID_TOKEN`: Shared cluster authentication token (preferred over `--token` CLI flag to keep secrets out of process lists and shell history).

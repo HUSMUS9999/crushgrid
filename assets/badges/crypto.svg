@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="177" height="20" viewBox="0 0 177 20" role="img" aria-label="crypto: BLAKE3 + AES-GCM">
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".12"/>
+    <stop offset="1" stop-opacity=".14"/>
+  </linearGradient>
+  <clipPath id="r">
+    <rect width="177" height="20" rx="3" fill="#fff"/>
+  </clipPath>
+  <g clip-path="url(#r)">
+    <rect width="46" height="20" fill="#4B5563"/>
+    <rect x="46" width="131" height="20" fill="#4F46E5"/>
+    <rect width="177" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="10.6">
+    <text aria-hidden="true" x="23.0" y="14.6" fill="#010101" fill-opacity=".3">crypto</text>
+    <text x="23.0" y="13.7">crypto</text>
+    <text aria-hidden="true" x="111.5" y="14.6" fill="#010101" fill-opacity=".3" font-weight="600">BLAKE3 + AES-GCM</text>
+    <text x="111.5" y="13.7" font-weight="600">BLAKE3 + AES-GCM</text>
+  </g>
+</svg>

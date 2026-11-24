@@ -1,14 +1,14 @@
 # Cluster Setup Guide
 
-`squiz-archive` scales to as many nodes as you configure (LAN, WireGuard/Tailscale, or cloud instances) across Linux, Windows, and macOS.
+`crushgrid` scales to as many nodes as you configure (LAN, WireGuard/Tailscale, or cloud instances) across Linux, Windows, and macOS.
 
 Every node runs the same executable:
-- Contributing hosts run `squiz-archive worker`
-- The host holding the source files runs `squiz-archive pack`, `compress`, `unpack`, or `decompress`
+- Contributing hosts run `crushgrid worker`
+- The host holding the source files runs `crushgrid pack`, `compress`, `unpack`, or `decompress`
 
 ## 1. Generate a Shared Cluster Token
 
-The fastest way to create a `0600` `cluster.conf` with a 256-bit OS CSPRNG token is `squiz-archive init --nodes <host1:7878,host2:7878>`. To generate a token manually:
+The fastest way to create a `0600` `cluster.conf` with a 256-bit OS CSPRNG token is `crushgrid init --nodes <host1:7878,host2:7878>`. To generate a token manually:
 
 All connections perform mutual `BLAKE3` challenge-response authentication using a pre-shared token and 32-byte OS CSPRNG nonces, deriving a per-session 256-bit `AES-256-GCM` key (note: PSK derivation does not provide forward secrecy; rotate tokens periodically or run over WireGuard/Tailscale).
 
@@ -24,7 +24,7 @@ $b = New-Object byte[] 32
 ($b | ForEach-Object { $_.ToString("x2") }) -join ""
 ```
 
-Pass the secret via `SQUIZ_TOKEN` in the environment or in a `chmod 600` `cluster.conf` file. Avoid passing `--token` on the command line, which exposes the token in process listings and shell history.
+Pass the secret via `CRUSHGRID_TOKEN` in the environment or in a `chmod 600` `cluster.conf` file. Avoid passing `--token` on the command line, which exposes the token in process listings and shell history.
 
 ## 2. LAN Deployment (Ethernet or Wi-Fi)
 
@@ -32,14 +32,14 @@ Pass the secret via `SQUIZ_TOKEN` in the environment or in a `chmod 600` `cluste
 
 ```bash
 # Linux / macOS
-export SQUIZ_TOKEN="<64-hex-char-token>"
-squiz-archive worker --bind 0.0.0.0:7878 --max-threads 16 --max-mem 8G
+export CRUSHGRID_TOKEN="<64-hex-char-token>"
+crushgrid worker --bind 0.0.0.0:7878 --max-threads 16 --max-mem 8G
 ```
 
 ```powershell
 # Windows PowerShell
-$env:SQUIZ_TOKEN = "<64-hex-char-token>"
-.\squiz-archive.exe worker --bind 0.0.0.0:7878 --max-threads 10 --max-mem 4G
+$env:CRUSHGRID_TOKEN = "<64-hex-char-token>"
+.\crushgrid.exe worker --bind 0.0.0.0:7878 --max-threads 10 --max-mem 4G
 ```
 
 ### Firewall rules (LAN subnet only)
@@ -61,9 +61,9 @@ A WireGuard/Tailscale mesh connects home PCs, remote laptops, and cloud VMs with
 1. Install Tailscale or WireGuard on each host.
 2. Bind each worker strictly to its VPN interface IP:
    ```bash
-   export SQUIZ_TOKEN="<64-hex-char-token>"
+   export CRUSHGRID_TOKEN="<64-hex-char-token>"
    TS_IP=$(tailscale ip -4)
-   squiz-archive worker --bind "${TS_IP}:7878" --max-threads 20 --max-mem 16G --allow-auth-only
+   crushgrid worker --bind "${TS_IP}:7878" --max-threads 20 --max-mem 16G --allow-auth-only
    ```
 3. List all VPN peers in `cluster.conf`:
    ```ini
@@ -99,24 +99,24 @@ When connecting to workers on AWS, Hetzner, GCP, DigitalOcean, or VPS providers 
 Store the token in a root-only environment file so it is never readable in the unit file:
 
 ```bash
-sudo mkdir -p /etc/squiz-archive
-sudo install -m 600 /dev/null /etc/squiz-archive/worker.env
-printf 'SQUIZ_TOKEN=%s\n' "<64-hex-char-token>" | sudo tee /etc/squiz-archive/worker.env >/dev/null
+sudo mkdir -p /etc/crushgrid
+sudo install -m 600 /dev/null /etc/crushgrid/worker.env
+printf 'CRUSHGRID_TOKEN=%s\n' "<64-hex-char-token>" | sudo tee /etc/crushgrid/worker.env >/dev/null
 ```
 
 Create `/etc/systemd/system/squiz-worker.service`:
 
 ```ini
 [Unit]
-Description=squiz-archive distributed compression worker
+Description=crushgrid distributed compression worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 DynamicUser=yes
-EnvironmentFile=/etc/squiz-archive/worker.env
-ExecStart=/usr/local/bin/squiz-archive worker --bind 0.0.0.0:7878 --max-threads 32 --max-mem 16G
+EnvironmentFile=/etc/crushgrid/worker.env
+ExecStart=/usr/local/bin/crushgrid worker --bind 0.0.0.0:7878 --max-threads 32 --max-mem 16G
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -137,11 +137,11 @@ sudo journalctl -u squiz-worker -f
 
 ### Windows (Scheduled Task)
 
-Set `SQUIZ_TOKEN` as a user environment variable for a dedicated service account (avoid storing tokens inline in task arguments or running under `SYSTEM` unless required):
+Set `CRUSHGRID_TOKEN` as a user environment variable for a dedicated service account (avoid storing tokens inline in task arguments or running under `SYSTEM` unless required):
 
 ```powershell
-[Environment]::SetEnvironmentVariable("SQUIZ_TOKEN", "<64-hex-char-token>", "User")
-$action = New-ScheduledTaskAction -Execute "C:\squiz-archive\squiz-archive.exe" `
+[Environment]::SetEnvironmentVariable("CRUSHGRID_TOKEN", "<64-hex-char-token>", "User")
+$action = New-ScheduledTaskAction -Execute "C:\crushgrid\crushgrid.exe" `
   -Argument "worker --bind 0.0.0.0:7878 --max-threads 10 --max-mem 4G"
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 Register-ScheduledTask -TaskName "SquizArchiveWorker" -Action $action -Trigger $trigger
@@ -176,5 +176,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\tune-windows.ps1 -Revert -Fir
 Measure live multi-stream wire speed after tuning:
 
 ```bash
-squiz-archive net-bench --cluster cluster.conf --streams 4 --mib 32
+crushgrid net-bench --cluster cluster.conf --streams 4 --mib 32
 ```

@@ -334,6 +334,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crushgrid"
+version = "1.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "blake3",
+ "bzip3",
+ "clap",
+ "crossbeam-channel",
+ "libc",
+ "lz4_flex",
+ "ppmd-rust",
+ "rand",
+ "rayon",
+ "socket2",
+ "sysinfo",
+ "walkdir",
+ "xxhash-rust",
+ "xz2",
+ "zstd-safe",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -728,29 +751,6 @@ checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "squiz-archive"
-version = "1.0.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "blake3",
- "bzip3",
- "clap",
- "crossbeam-channel",
- "libc",
- "lz4_flex",
- "ppmd-rust",
- "rand",
- "rayon",
- "socket2",
- "sysinfo",
- "walkdir",
- "xxhash-rust",
- "xz2",
- "zstd-safe",
 ]
 
 [[package]]

@@ -16,16 +16,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: squiz-archive-linux-x86_64
-            bin: squiz-archive
+            artifact: crushgrid-linux-x86_64
+            bin: crushgrid
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: squiz-archive-windows-x86_64.exe
-            bin: squiz-archive.exe
+            artifact: crushgrid-windows-x86_64.exe
+            bin: crushgrid.exe
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: squiz-archive-macos-arm64
-            bin: squiz-archive
+            artifact: crushgrid-macos-arm64
+            bin: crushgrid
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -58,4 +58,4 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: squiz-archive-*
+          files: crushgrid-*

@@ -1,6 +1,12 @@
 # Changelog
 
-All notable changes to `squiz-archive` follow Semantic Versioning (`MAJOR.MINOR.PATCH`).
+All notable changes to `crushgrid` (formerly `squiz-archive`) follow Semantic Versioning (`MAJOR.MINOR.PATCH`).
+
+## [1.1.0] - 2026-11-24
+
+### Changed
+- Rebranded CLI and package from `squiz-archive` to **`crushgrid`** (`CRUSHGRID_TOKEN`, `~/.config/crushgrid/cluster.conf`) while keeping 100% `.sqz` archive format compatibility, wire-protocol PSK compatibility, and automatic fallback discovery for legacy `~/.config/squiz-archive/cluster.conf`.
+- Added adaptive Light/Dark fine-line SVG hero, compact self-hosted badges, Features-first README, and unbiased single-host benchmarks against `tar+gzip`, `tar+bzip2`, `tar+zstd`, and `tar+xz`.
 
 ## [1.0.0] - 2026-11-24
 

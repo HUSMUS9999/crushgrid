@@ -549,7 +549,7 @@ pub fn run_pack(params: PackParams<'_>) -> Result<JobSummary> {
 
     if !params.quiet {
         println!(
-            "[squiz-archive] Scanning {} (extension-class solid grouping + dedup)...",
+            "[crushgrid] Scanning {} (extension-class solid grouping + dedup)...",
             params.source_dir.display()
         );
     }
@@ -561,7 +561,7 @@ pub fn run_pack(params: PackParams<'_>) -> Result<JobSummary> {
     }
     if !params.quiet {
         println!(
-            "[squiz-archive] Plan: {} files, {} dirs, {:.2} GiB ({:.2} MiB) | skipped/protected: {}",
+            "[crushgrid] Plan: {} files, {} dirs, {:.2} GiB ({:.2} MiB) | skipped/protected: {}",
             regular_files,
             dirs,
             plan.total_bytes as f64 / 1073741824.0,
@@ -645,7 +645,7 @@ fn run_compress_stream(
             format!("{} L{}", params.codec.name(), params.level)
         };
         println!(
-            "[squiz-archive] Compress {} ({:.2} MiB) -> {} | codec={} | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
+            "[crushgrid] Compress {} ({:.2} MiB) -> {} | codec={} | fmt={:?} | blk={:.2} MiB ({} chunks) | nodes={} ({}T) | sec={:?} | wire={:?} | dedup={} | raw-bypass={}",
             source_label,
             total_orig_size as f64 / 1048576.0,
             params.output_path.display(),
@@ -1141,7 +1141,7 @@ fn run_extract_internal(params: DecompressParams<'_>, is_dir_unpack: bool) -> Re
 
     if !params.quiet {
         println!(
-            "[squiz-archive] {} {} ({:.2} MiB -> {:.2} MiB) | codec={} | fmt={:?} | chunks={} | files={} | nodes={} ({}T) | sched={:?}",
+            "[crushgrid] {} {} ({:.2} MiB -> {:.2} MiB) | codec={} | fmt={:?} | chunks={} | files={} | nodes={} ({}T) | sched={:?}",
             if is_dir_unpack { "Unpack" } else { "Decompress" },
             params.input_path.display(),
             comp_bytes as f64 / 1048576.0,
@@ -1450,7 +1450,7 @@ pub fn run_inspect(path: &Path, list_files: bool) -> Result<()> {
         .map(|(k, (cnt, bytes))| format!("{}:{} ({:.1} MiB)", k, cnt, *bytes as f64 / 1048576.0))
         .collect();
 
-    println!("\n=== squiz-archive Inspect: {} ===", path.display());
+    println!("\n=== crushgrid Inspect: {} ===", path.display());
     println!("  Format          : {:?} | Primary Codec: {} | Slabs: [{}]", m.format, m.codec.name(), codec_summary.join(", "));
     println!(
         "  Original Size   : {:.2} MiB ({:.2} GiB)",
@@ -2158,7 +2158,7 @@ pub fn run_net_bench(
     let actual_total_mib = frames_per_stream * streams * 2;
 
     println!(
-        "\n=== squiz-archive Network Layer Benchmark (sec={:?}, streams={}, {} MiB bidirectional/node) ===",
+        "\n=== crushgrid Network Layer Benchmark (sec={:?}, streams={}, {} MiB bidirectional/node) ===",
         security, streams, actual_total_mib
     );
 
@@ -2274,7 +2274,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn print_job_summary(op: &str, s: &JobSummary) {
-    println!("\n================ squiz-archive {} SUMMARY ================", op);
+    println!("\n================ crushgrid {} SUMMARY ================", op);
     println!(
         "  Wall Time   : {:.3} s | Throughput: {:.2} MiB/s (orig) | Ratio: {:.3}x ({:.2} -> {:.2} MiB)",
         s.elapsed_secs,

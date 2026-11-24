@@ -32,7 +32,7 @@ use worker::{WorkerConfig, run_worker};
 
 #[derive(Parser)]
 #[command(
-    name = "squiz-archive",
+    name = "crushgrid",
     version,
     about = "Distributed multi-node compression and archival CLI for LAN, VPN, and cloud hosts",
     after_help = "Presets (-m / --preset):\n  \
@@ -41,11 +41,11 @@ use worker::{WorkerConfig, run_worker};
   small     High ratio, fast multi-codec (Bzip3 on text/CSV, LZMA2+BCJ on binaries, LZMA2 L6 on mixed)\n  \
   max       Smallest archive (Bzip3 16M on text/code, LZMA2+BCJ L9 on binaries, LZMA2 L9 on mixed)\n\n\
 Quick Examples:\n  \
-  squiz-archive init                                      # Generate ~/.config/squiz-archive/cluster.conf\n  \
-  squiz-archive doctor                                    # Inspect CPU, RAM, config, and TCP stack\n  \
-  squiz-archive pack ./data --preset small                # Zero-config archive (auto-discovers user config)\n  \
-  squiz-archive unpack data.sqz                           # Extract in parallel\n  \
-  squiz-archive do \"compress ./logs as small as possible\" # Plain-English command mode"
+  crushgrid init                                      # Generate ~/.config/crushgrid/cluster.conf\n  \
+  crushgrid doctor                                    # Inspect CPU, RAM, config, and TCP stack\n  \
+  crushgrid pack ./data --preset small                # Zero-config archive (auto-discovers user config)\n  \
+  crushgrid unpack data.sqz                           # Extract in parallel\n  \
+  crushgrid do \"compress ./logs as small as possible\" # Natural-language command mode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -75,8 +75,8 @@ struct ClusterArgs {
     #[arg(short = 'i', long, default_value_t = false)]
     pick: bool,
 
-    /// Shared cluster auth token (recommended: set SQUIZ_TOKEN env var instead of CLI flag)
-    #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
+    /// Shared cluster auth token (recommended: set CRUSHGRID_TOKEN env var instead of CLI flag)
+    #[arg(long, env = "CRUSHGRID_TOKEN", default_value = "")]
     token: String,
 
     /// Transport security mode: aead (AES-256-GCM, default) or auth-only (for WireGuard/Tailscale)
@@ -106,10 +106,10 @@ struct ClusterArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Translate a plain-English request into a squiz-archive command and run it
+    /// Translate a natural-language request into a crushgrid command and run it
     #[command(name = "do", visible_alias = "ask")]
     Do {
-        /// Plain-English request, e.g. "compress ./backups as small as possible using 50% cpu"
+        /// Natural-language request, e.g. "compress ./backups as small as possible using 50% cpu"
         #[arg(required = true, num_args = 1..)]
         request: Vec<String>,
 
@@ -120,7 +120,7 @@ enum Commands {
 
     /// Interactive or scriptable cluster setup wizard (generates a 256-bit CSPRNG token and 0600 cluster.conf)
     Init {
-        /// Output config path (defaults to ~/.config/squiz-archive/cluster.conf or %APPDATA%\squiz-archive\cluster.conf)
+        /// Output config path (defaults to ~/.config/crushgrid/cluster.conf or %APPDATA%\crushgrid\cluster.conf)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -146,8 +146,8 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:7878")]
         bind: SocketAddr,
 
-        /// Shared authentication token (recommended: set SQUIZ_TOKEN env var instead of CLI flag)
-        #[arg(long, env = "SQUIZ_TOKEN")]
+        /// Shared authentication token (recommended: set CRUSHGRID_TOKEN env var instead of CLI flag)
+        #[arg(long, env = "CRUSHGRID_TOKEN")]
         token: String,
 
         /// Hard ceiling on CPU threads this worker will ever allocate
@@ -181,8 +181,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         local: bool,
 
-        /// Shared cluster auth token (or env SQUIZ_TOKEN)
-        #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
+        /// Shared cluster auth token (or env CRUSHGRID_TOKEN)
+        #[arg(long, env = "CRUSHGRID_TOKEN", default_value = "")]
         token: String,
 
         /// Transport security mode: aead (default) or auth-only
@@ -357,8 +357,8 @@ enum Commands {
         #[arg(long)]
         nodes: Option<String>,
 
-        /// Shared cluster auth token (or env SQUIZ_TOKEN)
-        #[arg(long, env = "SQUIZ_TOKEN", default_value = "")]
+        /// Shared cluster auth token (or env CRUSHGRID_TOKEN)
+        #[arg(long, env = "CRUSHGRID_TOKEN", default_value = "")]
         token: String,
 
         /// Transport security mode: aead (default) or auth-only
@@ -450,7 +450,7 @@ fn resolve_cluster(
     } else if !explicit_nodes {
         let auto = discover_default_cluster_config();
         if let Some(ref p) = auto {
-            println!("[squiz-archive] Auto-loaded cluster config: {}", p.display());
+            println!("[crushgrid] Auto-loaded cluster config: {}", p.display());
         }
         auto
     } else {
@@ -517,7 +517,7 @@ fn resolve_cluster(
 
 fn require_token_if_remote(rc: &ResolvedCluster) -> Result<()> {
     if rc.specs.iter().any(|s| !s.is_local) && rc.token.is_empty() {
-        bail!("remote nodes configured: set SQUIZ_TOKEN, pass --token, or define token= in --cluster");
+        bail!("remote nodes configured: set CRUSHGRID_TOKEN, pass --token, or define token= in --cluster");
     }
     Ok(())
 }
@@ -551,7 +551,7 @@ fn collect_node_specs(node_args: &[String], nodes_csv: Option<&str>, default_str
 }
 
 fn print_probe_table(probed: &[resource::ProbedNode]) {
-    println!("\n=== squiz-archive Cluster Probe ({} node(s)) ===", probed.len());
+    println!("\n=== crushgrid Cluster Probe ({} node(s)) ===", probed.len());
     println!(
         "{:<24} {:<10} {:<14} {:<32} {:<10} {:<12} {:<14}",
         "TARGET", "STATUS", "OS/ARCH", "CPU", "THREADS", "MEM (MAX)", "LINK"
@@ -591,13 +591,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Do { request, dry_run } => {
             let resolved_args = nl::parse_natural_tokens(&request)?;
             println!(
-                "[squiz-archive] Resolved: squiz-archive {}",
+                "[crushgrid] Resolved: crushgrid {}",
                 nl::format_resolved_command(&resolved_args)
             );
             if dry_run {
                 return Ok(());
             }
-            let mut argv = vec!["squiz-archive".to_string()];
+            let mut argv = vec!["crushgrid".to_string()];
             argv.extend(resolved_args);
             let parsed = Cli::try_parse_from(argv)?;
             dispatch(parsed)

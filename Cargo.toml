@@ -1,15 +1,15 @@
 [package]
-name = "squiz-archive"
-version = "1.0.0"
+name = "crushgrid"
+version = "1.1.0"
 edition = "2024"
 license = "MIT"
 description = "Distributed multi-node compression and archival CLI (Zstd, Bzip3, PPMd, LZMA2+BCJ, LZ4) with BLAKE3 dedup and AES-256-GCM"
-repository = "https://github.com/HUSMUS9999/squiz-archive"
+repository = "https://github.com/HUSMUS9999/crushgrid"
 keywords = ["compression", "distributed", "zstd", "bzip3", "lzma2"]
 categories = ["compression", "command-line-utilities", "network-programming"]
 
 [[bin]]
-name = "squiz-archive"
+name = "crushgrid"
 path = "src/main.rs"
 
 [dependencies]

@@ -2,7 +2,7 @@
 
 ## Pipeline Overview
 
-`squiz-archive` uses a pull-based, credit-gated work-stealing pipeline backed by bounded OS threads, `crossbeam-channel` queues, and a hard memory-budget semaphore (`ByteBudget`).
+`crushgrid` uses a pull-based, credit-gated work-stealing pipeline backed by bounded OS threads, `crossbeam-channel` queues, and a hard memory-budget semaphore (`ByteBudget`).
 
 ```text
 Input File / Sorted Multi-File Stream
@@ -29,7 +29,7 @@ Input File / Sorted Multi-File Stream
 ### `.zst` (Standard Zstd Seekable Format)
 - Concatenated independent Zstd frames (each with native content size and xxHash checksum) followed by an official Zstd Seekable skippable frame (`0x184D2A5E`, footer magic `0x8F92EAB1`).
 - Standard `zstd -d` ignores the skippable frame and decompresses normally.
-- `squiz-archive decompress` reads the seek table in O(1) and extracts frames in parallel via positional `pwrite` (Unix) / `seek_write` (Windows). Note: `squiz-archive decompress` requires a seekable `.zst` or `.sqz` archive.
+- `crushgrid decompress` reads the seek table in O(1) and extracts frames in parallel via positional `pwrite` (Unix) / `seek_write` (Windows). Note: `crushgrid decompress` requires a seekable `.zst` or `.sqz` archive.
 
 ### `.sqz` v3 (Universal Multi-Codec Container)
 - **Header (80 bytes):** magic `SQZA`, version (`3`), primary codec, level, flags, block size, total original size, chunk count, whole-stream `BLAKE3` digest (32 bytes), compressed file manifest offset & length.
@@ -55,6 +55,6 @@ Input File / Sorted Multi-File Stream
 ### Guardrails and Limitations
 - **Worker isolation:** Workers process pure byte buffers only; they never execute shell commands or access the filesystem.
 - **DoS protection:** 5-second pre-auth timeout; 64 MiB hard max-frame check enforced on both `payload_len` and `orig_len` before allocation; PPMd7 and Bzip3 decoder headers are bounds-checked (<= 64 MiB) before instantiation; `.sqz` seek tables and manifests are validated against file length and capped at 256 MiB; workers clamp requested threads/RAM to server-side `--max-threads` and `--max-mem` ceilings.
-- **No forward secrecy:** Session keys are derived from a static PSK and random nonces without an ephemeral Diffie-Hellman exchange. Rotate `SQUIZ_TOKEN` periodically, firewall public workers to coordinator IPs, or run inside WireGuard/Tailscale for forward-secret transport.
+- **No forward secrecy:** Session keys are derived from a static PSK and random nonces without an ephemeral Diffie-Hellman exchange. Rotate `CRUSHGRID_TOKEN` periodically, firewall public workers to coordinator IPs, or run inside WireGuard/Tailscale for forward-secret transport.
 - **Compression before encryption:** Adaptive wire pre-shrink (`zstd1`/`lz4`) runs inside the AEAD envelope for bulk file transfer performance. Pass `--wire-codec none` if operating in an adversarial chosen-plaintext oracle threat model.
 - **Integrity scope:** `.sqz` archives verify per-slab `XXH3-64` on every `decompress` and `unpack`, plus whole-stream `BLAKE3` on single-file `decompress` (unless `--no-verify` is passed). `.zst` seekable archives rely on `libzstd`'s native per-frame XXH64 checksum.

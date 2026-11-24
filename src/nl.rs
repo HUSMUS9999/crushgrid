@@ -15,7 +15,7 @@ pub fn format_resolved_command(args: &[String]) -> String {
         .join(" ")
 }
 
-/// Deterministic, offline natural-language intent parser for `squiz-archive do <request...>`.
+/// Deterministic, offline natural-language intent parser for `crushgrid do <request...>`.
 /// Preserves shell token boundaries when multiple arguments are passed, and tokenizes quoted
 /// strings when a single quoted sentence is passed.
 pub fn parse_natural_tokens(raw_args: &[String]) -> Result<Vec<String>> {
@@ -26,7 +26,7 @@ pub fn parse_natural_tokens(raw_args: &[String]) -> Result<Vec<String>> {
     };
 
     if tokens.is_empty() {
-        bail!("empty natural-language request; example: squiz-archive do \"compress ./folder as small as possible\"");
+        bail!("empty natural-language request; example: crushgrid do \"compress ./folder as small as possible\"");
     }
 
     // 1. Extract modifiers & explicit targets FIRST so filenames like `audit.log` or `init.sql`
@@ -152,7 +152,7 @@ pub fn parse_natural_tokens(raw_args: &[String]) -> Result<Vec<String>> {
     if is_bench || is_compress {
         let inp = input_path.ok_or_else(|| {
             anyhow::anyhow!(
-                "could not identify a file or directory path\nTip: quote paths with spaces, e.g. squiz-archive do \"compress ./my_folder as small as possible\""
+                "could not identify a file or directory path\nTip: quote paths with spaces, e.g. crushgrid do \"compress ./my_folder as small as possible\""
             )
         })?;
 
@@ -196,7 +196,7 @@ pub fn parse_natural_tokens(raw_args: &[String]) -> Result<Vec<String>> {
     }
 
     bail!(
-        "could not understand request\nExamples:\n  squiz-archive do \"compress ./backups as small as possible\"\n  squiz-archive do \"fast backup of ./logs using 50% cpu\"\n  squiz-archive do \"extract backups.sqz into ./restored\"\n  squiz-archive do \"check cluster nodes\""
+        "could not understand request\nExamples:\n  crushgrid do \"compress ./backups as small as possible\"\n  crushgrid do \"fast backup of ./logs using 50% cpu\"\n  crushgrid do \"extract backups.sqz into ./restored\"\n  crushgrid do \"check cluster nodes\""
     );
 }
 

@@ -19,7 +19,7 @@ use std::thread;
 
 fn temp_test_dir(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "squiz_archive_test_{}_{}",
+        "crushgrid_test_{}_{}",
         tag,
         std::process::id()
     ));

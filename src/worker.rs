@@ -91,7 +91,7 @@ pub fn run_worker(cfg: WorkerConfig) -> Result<()> {
     let listener: TcpListener = sock.into();
 
     println!(
-        "[squiz-archive worker] Listening on {} | host={} ({}) | CPU={} | ceiling: {}T / {} MiB | security={}",
+        "[crushgrid worker] Listening on {} | host={} ({}) | CPU={} | ceiling: {}T / {} MiB | security={}",
         cfg.bind_addr,
         caps.hostname,
         caps.os_arch,

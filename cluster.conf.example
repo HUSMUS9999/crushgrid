@@ -1,8 +1,8 @@
-# squiz-archive N-node cluster configuration
+# crushgrid N-node cluster configuration
 # Copy to cluster.conf and restrict permissions: chmod 600 cluster.conf
 # Usage:
-#   squiz-archive probe --cluster cluster.conf
-#   squiz-archive pack ./data -o ./data.sqz --cluster cluster.conf --pick
+#   crushgrid probe --cluster cluster.conf
+#   crushgrid pack ./data -o ./data.sqz --cluster cluster.conf --pick
 
 # Generate with: openssl rand -hex 32
 token = REPLACE_WITH_YOUR_64_CHAR_HEX_TOKEN

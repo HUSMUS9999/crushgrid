@@ -1,6 +1,6 @@
 # Compression Algorithms and Presets
 
-`squiz-archive` embeds six general-purpose lossless codecs covering distinct algorithmic families, plus a per-slab classifier that automatically routes each block to the best codec inside `.sqz` v3 archives.
+`crushgrid` embeds six general-purpose lossless codecs covering distinct algorithmic families, plus a per-slab classifier that automatically routes each block to the best codec inside `.sqz` v3 archives.
 
 ## Included Codecs
 
