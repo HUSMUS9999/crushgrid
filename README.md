@@ -95,9 +95,9 @@ Power users can override any preset with `--codec zstd|bzip3|ppmd|lzma2|lzma2-bc
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-arch-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-arch-light.svg" />
-    <img src="assets/crushgrid-arch-light.svg" alt="CrushGrid Distributed Compression Pipeline Architecture" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/crushgrid-arch-v2-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/crushgrid-arch-v2-light.svg" />
+    <img src="assets/crushgrid-arch-v2-light.svg" alt="CrushGrid Distributed Compression Pipeline Architecture" width="100%" />
   </picture>
 </p>
 
